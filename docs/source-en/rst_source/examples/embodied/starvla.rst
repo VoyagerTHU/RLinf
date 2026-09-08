@@ -213,6 +213,89 @@ Run training
 
    bash examples/embodiment/run_embodiment.sh libero_spatial_grpo_starvla
 
+RoboCasa GR1 CupToDrawerClose
+-----------------------------
+
+The repository also includes a grouped-GRPO setup for the StarVLA Qwen3 OFT
+checkpoint on the RoboCasa GR1 ``CupToDrawerClose`` task:
+
+* a fixed, disjoint 500-seed training pool;
+* 16 seeds sampled without replacement per rollout collection;
+* 8 stochastic trajectories for every sampled seed (128 rollouts total);
+* checkpoint evaluation on the same fixed 50-seed suite at a configured step
+  interval;
+* train and validation videos; and
+* local JSONL plus W&B tables containing every seed, trajectory outcome, and
+  per-seed success rate.
+
+Update the model and dependency paths in the config or launcher if they differ
+from the local installation, then run:
+
+.. code-block:: bash
+
+   bash examples/embodiment/run_robocasa_gr1_cup_drawer_grpo.sh
+
+The main config is
+``examples/embodiment/config/robocasa_gr1_cup_drawer_grpo_starvla.yaml``.
+Detailed rollout records are written under ``rollout_tables/`` in the log
+directory and uploaded as ``train/seed_rollouts`` and
+``eval/seed_rollouts`` W&B tables. Videos are stored under ``video/train`` and
+``video/eval``. The evaluation uses 56 simulator slots for communication
+divisibility, but six slots are marked as padding and excluded from metrics, so
+``eval/success_once`` is computed over exactly 50 fixed seeds.
+On the configured host, simulator subprocesses remove ``CUDA_VISIBLE_DEVICES``
+before importing robosuite and select the physical NVIDIA EGL device assigned
+to each environment worker. Actor and rollout workers keep their CUDA
+assignments. Set ``egl_device`` explicitly only on hosts where automatic
+physical-device selection is unavailable.
+This host recipe pins Ray to ``2.49.2``: Ray ``2.57.0`` was observed to abort
+RLinf ``ChannelWorker`` process-group initialization with a pybind11
+deallocation error. The launcher checks the version before starting. It also
+keeps ``gradient_checkpointing: false``, matching RLinf's official StarVLA
+recipe because QwenOFT does not provide a checkpoint-safe forward under FSDP.
+
+The checkpoint stores the action head in BF16. Small Adam updates can therefore
+round back to the same stored value even when the optimizer step succeeds. The
+RoboCasa config keeps the VLM backbone in BF16 while setting
+``actor.model.action_model_precision: fp32``. It also wraps the OFT
+``L1RegressionActionHead`` as a separate FSDP unit, preserving uniform dtypes
+inside every flat parameter. Actor, Hugging Face rollout, sparse weight sync,
+and standalone checkpoint evaluation all retain the per-module dtype.
+
+The StarVLA model config also supports parameter-efficient Qwen3-VL updates.
+Set ``actor.model.is_lora: true`` and
+``actor.model.lora_scope: qwen3_vl`` to inject LoRA only into the Qwen3-VL
+vision/language subtree. By default the action head remains frozen. Set
+``actor.model.lora_train_action_head: true`` to jointly optimize the Qwen3-VL
+adapters and the complete action head; Qwen base weights and a fixed
+``actor_logstd`` remain frozen. For sparse patch synchronization, select the
+action-head prefix together with the ``.lora_A.`` and ``.lora_B.`` name
+fragments so resumed rollout workers receive both trained components.
+
+The GR1 policy's joint action contains ``16 x 29 = 464`` Gaussian dimensions,
+so its PPO update is substantially more sensitive than the 8 x 7-D LIBERO
+recipe. The supplied config uses a ``1e-9`` actor learning rate, 512 chunk
+samples per global batch, at most five optimizer steps per rollout, and a
+``target_kl`` safety boundary. Metrics report the first, last, and maximum
+global-batch KL plus whether the boundary or optimizer-step limit stopped the
+remaining minibatches.
+
+Use the controller script to alternate training and official-compatible fixed
+50-seed evaluation. It registers the original checkpoint as step 0, keeps
+periodic checkpoints, and records the checkpoint with the best fixed-seed
+result:
+
+.. code-block:: bash
+
+   EVAL_INTERVAL=2 TARGET_MAX_STEPS=10 \
+     bash examples/embodiment/run_robocasa_gr1_cup_drawer_grpo_eval_loop.sh
+
+Both actor and rollout load the same StarVLA checkpoint at startup, so this
+recipe disables the patch syncer's redundant full-state ``init_sync``. On the
+FSDP-DTensor stack used for this task, that initial full overwrite makes the
+pre-update KL invalid; later sparse weight deltas remain enabled and synchronize
+normal training updates.
+
 Evaluation
 ----------
 

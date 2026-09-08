@@ -40,6 +40,10 @@ from rlinf.utils.nested_dict_process import (
     update_nested_cfg,
 )
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.rollout_horizon import (
+    resolve_action_steps_per_chunk,
+    resolve_num_chunk_steps,
+)
 
 
 class EnvWorker(Worker):
@@ -102,13 +106,17 @@ class EnvWorker(Worker):
             )
         self.n_train_chunk_steps = 0
         if not self.only_eval:
-            self.n_train_chunk_steps = (
-                self.cfg.env.train.max_steps_per_rollout_epoch
-                // self.cfg.actor.model.num_action_chunks
+            self.train_action_steps_per_chunk = resolve_action_steps_per_chunk(
+                self.cfg.env.train, self.cfg.actor.model
             )
-        self.n_eval_chunk_steps = (
-            self.cfg.env.eval.max_steps_per_rollout_epoch
-            // self.cfg.actor.model.num_action_chunks
+            self.n_train_chunk_steps = resolve_num_chunk_steps(
+                self.cfg.env.train, self.cfg.actor.model
+            )
+        self.eval_action_steps_per_chunk = resolve_action_steps_per_chunk(
+            self.cfg.env.eval, self.cfg.actor.model
+        )
+        self.n_eval_chunk_steps = resolve_num_chunk_steps(
+            self.cfg.env.eval, self.cfg.actor.model
         )
         self.actor_split_num = self.get_actor_split_num()
 
@@ -156,6 +164,16 @@ class EnvWorker(Worker):
 
         if not self.only_eval:
             self._init_env()
+
+    def set_global_step(self, global_step: int) -> None:
+        """Align resumable environment state with the runner's global step."""
+        global_step = int(global_step)
+        if global_step < 0:
+            raise ValueError("global_step must be non-negative")
+        selection_round = global_step * int(self.rollout_epoch)
+        for env in self.env_list:
+            if hasattr(env, "set_seed_selection_round"):
+                env.set_seed_selection_round(selection_round)
 
     def update_env_cfg(self):
         if not self.only_eval:
@@ -418,17 +436,20 @@ class EnvWorker(Worker):
                 if chunk_truncations[:, -1].any():
                     assert chunk_truncations[:, -1].all()
                     if "episode" in infos:
-                        for key in infos["episode"]:
-                            env_info[key] = infos["episode"][key].cpu()
+                        env_info.update(
+                            self._extract_episode_metrics(infos["episode"])
+                        )
             else:
                 if "episode" in infos:
-                    for key in infos["episode"]:
-                        env_info[key] = infos["episode"][key].cpu()
+                    env_info.update(self._extract_episode_metrics(infos["episode"]))
         elif chunk_dones.any():
             if "final_info" in infos:
                 final_info = infos["final_info"]
-                for key in final_info["episode"]:
-                    env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
+                env_info.update(
+                    self._extract_episode_metrics(
+                        final_info["episode"], selection=chunk_dones[:, -1]
+                    )
+                )
 
         intervene_actions = (
             infos["intervene_action"] if "intervene_action" in infos else None
@@ -497,17 +518,49 @@ class EnvWorker(Worker):
         if newly_done.any():
             if "final_info" in infos:
                 final_info = infos["final_info"]
-                for key in final_info["episode"]:
-                    env_info[key] = final_info["episode"][key][newly_done].cpu()
+                env_info.update(
+                    self._extract_episode_metrics(
+                        final_info["episode"], selection=newly_done
+                    )
+                )
             elif "episode" in infos:
-                for key in infos["episode"]:
-                    env_info[key] = infos["episode"][key][newly_done].cpu()
+                env_info.update(
+                    self._extract_episode_metrics(
+                        infos["episode"], selection=newly_done
+                    )
+                )
 
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
         )
         return env_output, env_info
+
+    @staticmethod
+    def _extract_episode_metrics(
+        episode_info: dict[str, Any], selection: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
+        """Copy episode metrics to CPU and apply completion/validity masks."""
+        metric_valid = episode_info.get("metric_valid", None)
+        combined_selection = selection
+        if metric_valid is not None:
+            metric_valid = torch.as_tensor(metric_valid, dtype=torch.bool)
+            combined_selection = (
+                metric_valid
+                if combined_selection is None
+                else torch.as_tensor(combined_selection, dtype=torch.bool)
+                & metric_valid
+            )
+
+        metrics = {}
+        for key, value in episode_info.items():
+            if key == "metric_valid":
+                continue
+            tensor = torch.as_tensor(value)
+            if combined_selection is not None:
+                tensor = tensor[combined_selection]
+            metrics[key] = tensor.cpu()
+        return metrics
 
     def _build_chunk_final_obs(self, obs_list, infos_list):
         """Build per-env terminal observations for a whole chunk.
@@ -836,7 +889,7 @@ class EnvWorker(Worker):
             return (
                 torch.zeros((self.train_num_envs_per_stage,), dtype=bool)
                 .unsqueeze(1)
-                .repeat(1, self.cfg.actor.model.num_action_chunks)
+                .repeat(1, self.train_action_steps_per_chunk)
             )
 
         env_outputs: list[EnvOutput] = []

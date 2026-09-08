@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import random
 from typing import Any, Literal
 
 import numpy as np
@@ -31,6 +32,10 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.rollout_horizon import (
+    resolve_action_steps_per_chunk,
+    resolve_num_chunk_steps,
+)
 
 
 class MultiStepRolloutWorker(Worker):
@@ -73,13 +78,17 @@ class MultiStepRolloutWorker(Worker):
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
         self.enable_eval = cfg.runner.val_check_interval > 0 or cfg.runner.only_eval
 
-        self.n_train_chunk_steps = (
-            cfg.env.train.max_steps_per_rollout_epoch
-            // cfg.actor.model.num_action_chunks
+        self.train_action_steps_per_chunk = resolve_action_steps_per_chunk(
+            cfg.env.train, cfg.actor.model
         )
-        self.n_eval_chunk_steps = (
-            cfg.env.eval.max_steps_per_rollout_epoch
-            // cfg.actor.model.num_action_chunks
+        self.n_train_chunk_steps = resolve_num_chunk_steps(
+            cfg.env.train, cfg.actor.model
+        )
+        self.eval_action_steps_per_chunk = resolve_action_steps_per_chunk(
+            cfg.env.eval, cfg.actor.model
+        )
+        self.n_eval_chunk_steps = resolve_num_chunk_steps(
+            cfg.env.eval, cfg.actor.model
         )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
@@ -102,6 +111,11 @@ class MultiStepRolloutWorker(Worker):
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
             self.hf_model.load_state_dict(model_dict)
+            restore_fixed_logstd = getattr(
+                self.hf_model, "restore_configured_fixed_actor_logstd", None
+            )
+            if restore_fixed_logstd is not None:
+                restore_fixed_logstd()
 
         if self.cfg.rollout.get("expert_model", None):
             expert_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -199,6 +213,38 @@ class MultiStepRolloutWorker(Worker):
                 ),
             }
 
+    def _reset_train_sampling_rng(self) -> int | None:
+        """Reset stochastic action sampling to a reproducible policy-version stream.
+
+        Ray worker startup and model construction consume process-global RNG state.
+        Without an explicit reset, identical checkpoints can therefore collect
+        different Gaussian action perturbations across otherwise identical runs.
+        Each rollout rank receives a disjoint deterministic stream, and resuming a
+        later policy version advances to a new stream without repeating actions.
+        """
+        base_seed = self.cfg.rollout.get("training_sampling_seed", None)
+        if base_seed is None:
+            return None
+        base_seed = int(base_seed)
+        if base_seed < 0:
+            raise ValueError(
+                "rollout.training_sampling_seed must be non-negative, got "
+                f"{base_seed}."
+            )
+        sampling_seed = (
+            base_seed + int(self.version) * int(self._world_size) + int(self._rank)
+        )
+        # NumPy accepts uint32 seeds while torch and Python accept larger ints.
+        random.seed(sampling_seed)
+        np.random.seed(sampling_seed % (2**32))
+        torch.manual_seed(sampling_seed)
+        self.log_info(
+            "Reset training action-sampling RNG: "
+            f"base_seed={base_seed}, version={self.version}, "
+            f"rank={self._rank}, effective_seed={sampling_seed}"
+        )
+        return sampling_seed
+
     def update_dagger_beta(self):
         if self.expert_model is None:
             return
@@ -248,8 +294,71 @@ class MultiStepRolloutWorker(Worker):
             dst_rank=self._rank,
         )
 
+    @staticmethod
+    def _slice_env_obs_batch(
+        env_obs: dict[str, Any], start: int, end: int
+    ) -> dict[str, Any]:
+        sliced = {}
+        for key, value in env_obs.items():
+            if value is None:
+                sliced[key] = None
+            elif isinstance(value, torch.Tensor | np.ndarray | list | tuple):
+                sliced[key] = value[start:end]
+            else:
+                raise TypeError(
+                    f"Cannot microbatch env_obs[{key!r}] of type {type(value)!r}"
+                )
+        return sliced
+
+    @classmethod
+    def _merge_prediction_values(cls, values: list[Any]) -> Any:
+        first = values[0]
+        if all(value is None for value in values):
+            return None
+        if isinstance(first, torch.Tensor):
+            return torch.cat(values, dim=0)
+        if isinstance(first, np.ndarray):
+            return np.concatenate(values, axis=0)
+        if isinstance(first, dict):
+            return {
+                key: cls._merge_prediction_values([value[key] for value in values])
+                for key in first
+            }
+        if isinstance(first, bool):
+            return any(bool(value) for value in values)
+        if all(value == first for value in values):
+            return first
+        raise TypeError(
+            f"Cannot merge microbatched prediction values of type {type(first)!r}"
+        )
+
     @Worker.timer("predict")
     def predict(
+        self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        micro_batch_size = int(
+            self.cfg.rollout.get("inference_micro_batch_size", 0) or 0
+        )
+        batch_size = self._infer_env_batch_size(env_obs)
+        if micro_batch_size <= 0 or batch_size <= micro_batch_size:
+            return self._predict_full_batch(env_obs, mode)
+
+        predictions = [
+            self._predict_full_batch(
+                self._slice_env_obs_batch(env_obs, start, start + micro_batch_size),
+                mode,
+            )
+            for start in range(0, batch_size, micro_batch_size)
+        ]
+        actions = self._merge_prediction_values(
+            [prediction[0] for prediction in predictions]
+        )
+        results = self._merge_prediction_values(
+            [prediction[1] for prediction in predictions]
+        )
+        return actions, results
+
+    def _predict_full_batch(
         self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         kwargs = (
@@ -396,7 +505,7 @@ class MultiStepRolloutWorker(Worker):
                 save_flags = None
                 if result.get("expert_label_flag", False):
                     save_flags = torch.full(
-                        (actions.shape[0], self.cfg.actor.model.num_action_chunks),
+                        (actions.shape[0], actions.shape[1]),
                         True,
                         dtype=torch.bool,
                         device=actions.device,
@@ -441,6 +550,8 @@ class MultiStepRolloutWorker(Worker):
     ):
         if self.enable_offload:
             self.reload_model()
+
+        self._reset_train_sampling_rng()
 
         for _ in tqdm(
             range(self.rollout_epoch),

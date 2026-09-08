@@ -32,6 +32,7 @@ from rlinf.utils.placement import (
     ModelParallelComponentPlacement,
     PlacementMode,
 )
+from rlinf.utils.rollout_horizon import resolve_action_steps_per_chunk
 
 if TYPE_CHECKING:
     from megatron.core.model_parallel_config import ModelParallelConfig
@@ -836,11 +837,12 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.eval.total_num_envs // env_world_size // rollout.pipeline_stage_num must be divisible by the group size"
         )
-        assert (
-            cfg.env.eval.max_steps_per_rollout_epoch % cfg.actor.model.num_action_chunks
-            == 0
-        ), (
-            "env.eval.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
+        eval_action_steps = resolve_action_steps_per_chunk(
+            cfg.env.eval, cfg.actor.model
+        )
+        assert cfg.env.eval.max_steps_per_rollout_epoch % eval_action_steps == 0, (
+            "env.eval.max_steps_per_rollout_epoch must be divisible by the "
+            f"executed action horizon ({eval_action_steps})"
         )
 
     if not cfg.runner.only_eval:
@@ -865,12 +867,12 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.train.total_num_envs // env_world_size // rollout.pipeline_stage_num must be divisible by the group size"
         )
-        assert (
-            cfg.env.train.max_steps_per_rollout_epoch
-            % cfg.actor.model.num_action_chunks
-            == 0
-        ), (
-            "env.train.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
+        train_action_steps = resolve_action_steps_per_chunk(
+            cfg.env.train, cfg.actor.model
+        )
+        assert cfg.env.train.max_steps_per_rollout_epoch % train_action_steps == 0, (
+            "env.train.max_steps_per_rollout_epoch must be divisible by the "
+            f"executed action horizon ({train_action_steps})"
         )
 
     with open_dict(cfg):
@@ -1030,11 +1032,12 @@ def validate_offline_cfg(cfg: DictConfig) -> DictConfig:
         ), (
             "env.eval.total_num_envs // env_world_size // rollout.pipeline_stage_num must be divisible by the group size"
         )
-        assert (
-            cfg.env.eval.max_steps_per_rollout_epoch % cfg.actor.model.num_action_chunks
-            == 0
-        ), (
-            "env.eval.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
+        eval_action_steps = resolve_action_steps_per_chunk(
+            cfg.env.eval, cfg.actor.model
+        )
+        assert cfg.env.eval.max_steps_per_rollout_epoch % eval_action_steps == 0, (
+            "env.eval.max_steps_per_rollout_epoch must be divisible by the "
+            f"executed action horizon ({eval_action_steps})"
         )
     return cfg
 
@@ -1219,7 +1222,12 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
         cfg = validate_offline_cfg(cfg)
 
     if cfg.runner.task_type != "sft":
-        if cfg.algorithm.adv_type in ("grpo", "grpo_dynamic", "reinpp_baseline"):
+        if cfg.algorithm.adv_type in (
+            "grpo",
+            "temporal_grpo",
+            "grpo_dynamic",
+            "reinpp_baseline",
+        ):
             assert cfg.algorithm.group_size > 1
 
     assert cfg.actor.training_backend in SUPPORTED_TRAINING_BACKENDS, (

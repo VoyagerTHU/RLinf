@@ -17,6 +17,7 @@ import gc
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..collective.collective_group import _PROCESS_GROUP_INIT_LOCK
 from ..worker import Worker, WorkerAddress
 from .channel import DEFAULT_KEY
 
@@ -261,9 +262,12 @@ class ChannelWorker(Worker):
                     memory_allocated / memory_reserved if memory_reserved > 0 else 1.0
                 )
                 if current_mem_util < mem_clean_threshold:
-                    gc.collect()
-                    Worker.torch_platform.synchronize()
-                    Worker.torch_platform.empty_cache()
+                    # Do not collect partially constructed pybind ProcessGroup
+                    # wrappers while a communication thread is initializing c10d.
+                    with _PROCESS_GROUP_INIT_LOCK:
+                        gc.collect()
+                        Worker.torch_platform.synchronize()
+                        Worker.torch_platform.empty_cache()
                     memory_reserved = Worker.torch_platform.memory_reserved()
                     memory_allocated = Worker.torch_platform.memory_allocated()
                     mem_util_after_clean = (

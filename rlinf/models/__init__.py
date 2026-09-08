@@ -15,6 +15,7 @@
 from typing import Callable, Optional
 
 from omegaconf import DictConfig
+from torch import nn
 
 from rlinf.config import EMBODIED_MODEL, SupportedModel, torch_dtype_from_precision
 from rlinf.scheduler import Worker
@@ -224,7 +225,21 @@ def get_model(cfg: DictConfig):
     if cfg.is_lora:
         from peft import LoraConfig, PeftModel, get_peft_model
 
-        if not hasattr(cfg, "lora_path") or cfg.lora_path is None:
+        lora_scope = str(cfg.get("lora_scope", "model")).strip().lower()
+        if model_type == SupportedModel.STARVLA.value and lora_scope in {
+            "qwen3_vl",
+            "qwen3-vl",
+            "qwen_vl",
+        }:
+            if getattr(cfg, "lora_path", None) is not None:
+                raise ValueError(
+                    "StarVLA Qwen3-VL-only LoRA currently expects adapters in "
+                    "the RLinf full checkpoint; actor.model.lora_path is not supported"
+                )
+            from rlinf.models.embodiment.starvla import apply_qwen3_vl_lora
+
+            model = apply_qwen3_vl_lora(model, cfg)
+        elif not hasattr(cfg, "lora_path") or cfg.lora_path is None:
             lora_config = LoraConfig(
                 r=cfg.lora_rank,
                 lora_alpha=cfg.lora_rank,
@@ -263,8 +278,9 @@ def get_model(cfg: DictConfig):
         else:
             model = PeftModel.from_pretrained(model, cfg.lora_path, is_trainable=True)
 
-        if hasattr(model, "value_head"):
-            for param in model.value_head.parameters():
+        value_head = getattr(model, "value_head", None)
+        if isinstance(value_head, nn.Module):
+            for param in value_head.parameters():
                 param.requires_grad = True
 
     return model

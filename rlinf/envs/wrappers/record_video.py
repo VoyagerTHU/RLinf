@@ -485,3 +485,8 @@ class RecordVideo(gym.Wrapper):
     def update_reset_state_ids(self):
         if hasattr(self.env, "update_reset_state_ids"):
             self.env.update_reset_state_ids()
+
+    def set_seed_selection_round(self, selection_round: int) -> None:
+        """Forward a deterministic training-seed cursor to the wrapped env."""
+        if hasattr(self.env, "set_seed_selection_round"):
+            self.env.set_seed_selection_round(selection_round)

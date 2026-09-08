@@ -142,6 +142,9 @@ class WeightSyncer(ABC):
                 init_sync_prefixes=OmegaConf.select(
                     patch_config, "init_sync.prefixes", default=None
                 ),
+                init_sync_name_substrings=OmegaConf.select(
+                    patch_config, "init_sync.name_substrings", default=None
+                ),
                 init_sync_bucket_size=OmegaConf.select(
                     patch_config,
                     "init_sync.bucket_size",

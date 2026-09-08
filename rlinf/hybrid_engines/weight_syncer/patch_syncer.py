@@ -582,6 +582,7 @@ class PatchWeightSyncer(WeightSyncer):
         compression_algorithm: str = "none",
         init_sync_enabled: bool = False,
         init_sync_prefixes: list[str] | None = None,
+        init_sync_name_substrings: list[str] | None = None,
         init_sync_bucket_size: int = 128 * 1024 * 1024,
     ):
         super().__init__()
@@ -598,8 +599,15 @@ class PatchWeightSyncer(WeightSyncer):
             if init_sync_prefixes is None
             else [str(prefix) for prefix in init_sync_prefixes]
         )
+        self.init_sync_name_substrings = (
+            None
+            if init_sync_name_substrings is None
+            else [str(substring) for substring in init_sync_name_substrings]
+        )
         if self.init_sync_enabled and self.init_sync_prefixes == []:
             raise ValueError("Patch init sync prefixes must not be empty")
+        if self.init_sync_enabled and self.init_sync_name_substrings == []:
+            raise ValueError("Patch init sync name substrings must not be empty")
         self.init_sync_bucket_size = init_sync_bucket_size
         self.compressor = PatchCompressor.create(
             compression_algorithm=compression_algorithm,
@@ -610,17 +618,27 @@ class PatchWeightSyncer(WeightSyncer):
         self,
         state_dict: dict[str, torch.Tensor | DTensor],
     ) -> list[tuple[str, torch.Tensor | DTensor]]:
-        if self.init_sync_prefixes is None:
+        if self.init_sync_prefixes is None and self.init_sync_name_substrings is None:
             return list(state_dict.items())
 
-        matched_prefixes = dict.fromkeys(self.init_sync_prefixes, False)
+        prefixes = self.init_sync_prefixes or []
+        name_substrings = self.init_sync_name_substrings or []
+        matched_prefixes = dict.fromkeys(prefixes, False)
+        matched_substrings = dict.fromkeys(name_substrings, False)
         selected_weights: list[tuple[str, torch.Tensor | DTensor]] = []
         for key, value in state_dict.items():
-            for prefix in self.init_sync_prefixes:
+            selected = False
+            for prefix in prefixes:
                 if key == prefix or key.startswith(f"{prefix}."):
                     matched_prefixes[prefix] = True
-                    selected_weights.append((key, value))
+                    selected = True
                     break
+            for substring in name_substrings:
+                if substring in key:
+                    matched_substrings[substring] = True
+                    selected = True
+            if selected:
+                selected_weights.append((key, value))
 
         unmatched_prefixes = [
             prefix for prefix, matched in matched_prefixes.items() if not matched
@@ -629,6 +647,17 @@ class PatchWeightSyncer(WeightSyncer):
             raise ValueError(
                 "Patch init sync prefixes did not match any state_dict keys: "
                 f"{unmatched_prefixes}"
+            )
+
+        unmatched_substrings = [
+            substring
+            for substring, matched in matched_substrings.items()
+            if not matched
+        ]
+        if unmatched_substrings:
+            raise ValueError(
+                "Patch init sync name substrings did not match any state_dict "
+                f"keys: {unmatched_substrings}"
             )
 
         return selected_weights

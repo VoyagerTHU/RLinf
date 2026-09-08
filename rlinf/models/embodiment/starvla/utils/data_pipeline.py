@@ -90,6 +90,40 @@ def build_examples_from_env_obs(
     return examples
 
 
+def resize_env_obs_images_cv2(
+    env_obs: dict[str, Any], target_size: tuple[int, int] | list[int]
+) -> dict[str, Any]:
+    """Resize batched RGB observations with the official GR1 interpolation.
+
+    StarVLA's RoboCasa client applies OpenCV ``INTER_AREA`` before sending an
+    image to the model. The generic StarVLA path otherwise resizes the PIL
+    image with bicubic interpolation, which is measurably different in a
+    closed-loop rollout.
+    """
+    import cv2 as cv
+
+    width, height = (int(target_size[0]), int(target_size[1]))
+    resized_obs = dict(env_obs)
+    for key in ("main_images", "extra_view_images", "wrist_images"):
+        value = env_obs.get(key)
+        if value is None:
+            continue
+        was_tensor = torch.is_tensor(value)
+        array = tensor_to_numpy_compatible(value) if was_tensor else np.asarray(value)
+        if array.ndim < 4 or array.shape[-1] not in (1, 3, 4):
+            raise ValueError(
+                f"Expected batched channel-last images for {key!r}, got {array.shape}"
+            )
+        leading_shape = array.shape[:-3]
+        flat = array.reshape(-1, *array.shape[-3:])
+        resized = np.stack(
+            [cv.resize(image, (width, height), interpolation=cv.INTER_AREA) for image in flat]
+        ).reshape(*leading_shape, height, width, array.shape[-1])
+        resized = np.ascontiguousarray(resized)
+        resized_obs[key] = torch.from_numpy(resized) if was_tensor else resized
+    return resized_obs
+
+
 def get_scalar(value: Any, default: Any, cast):
     """Extract scalar from python/tensor value with fallback."""
     if value is None:
@@ -211,13 +245,19 @@ def fetch_action_for_logprob_for_default_forward(
     if isinstance(action_for_logprob, torch.Tensor):
         if action_for_logprob.ndim == 2:
             bsz = action_for_logprob.shape[0]
+            reference_chunks = int(reference.shape[-2])
             action_for_logprob = action_for_logprob.view(
-                bsz, policy.num_action_chunks, policy.action_dim
+                bsz, reference_chunks, policy.action_dim
             )
         elif action_for_logprob.ndim != 3:
             raise ValueError(
                 "Expected 'action_for_logprob' [B, T*D] or [B,T,D], "
                 f"got {action_for_logprob.shape}"
+            )
+        if action_for_logprob.shape != reference.shape:
+            raise ValueError(
+                "Cached 'action_for_logprob' does not match the executed action "
+                f"horizon: cached={action_for_logprob.shape}, reference={reference.shape}"
             )
         return action_for_logprob.to(device=reference.device, dtype=reference.dtype)
     else:

@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.modules.q_head import MultiQHead
 
 from .dispatch import get_default_forward_handler, get_rollout_handler
 from .utils import action_space as action_space_utils
@@ -38,6 +39,14 @@ from .utils.profile import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class StarVLAValueHead(nn.Linear):
+    """Small PPO critic head that can be targeted by FSDP wrap policies."""
+
+
+class StarVLAMultiQHead(MultiQHead):
+    """Twin SAC critics exposed as a distinct FSDP wrapping target."""
 
 
 class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
@@ -63,6 +72,14 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         action_stats_source: str = "minmax",
         enable_state_input: bool = True,
         policy_setup: Optional[str] = None,
+        initial_logstd: float = -2.5,
+        trainable_logstd: bool = True,
+        num_executed_action_chunks: Optional[int] = None,
+        rollout_prompt_seq_len: Optional[int] = None,
+        add_q_head: bool = False,
+        num_q_heads: int = 2,
+        q_hidden_dims: tuple[int, ...] = (512, 256),
+        sac_task_description: Optional[str] = None,
     ):
         super().__init__()
 
@@ -70,6 +87,17 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         self.starvla_model = starvla_model
         self.action_dim = int(action_dim)
         self.num_action_chunks = int(num_action_chunks)
+        self.num_executed_action_chunks = (
+            self.num_action_chunks
+            if num_executed_action_chunks is None
+            else int(num_executed_action_chunks)
+        )
+        if not 1 <= self.num_executed_action_chunks <= self.num_action_chunks:
+            raise ValueError(
+                "num_executed_action_chunks must be between 1 and "
+                f"num_action_chunks={self.num_action_chunks}, got "
+                f"{self.num_executed_action_chunks}"
+            )
         if unnorm_key is None:
             raise ValueError(
                 "starVLA requires cfg.unnorm_key to unnormalize actions for env rollout. "
@@ -86,6 +114,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             unnorm_key=self.unnorm_key,
             action_dim=self.action_dim,
             action_stats_source=self.action_stats_source,
+            preserve_float64=self.policy_setup == "gr1",
         )
 
         # 3) Dispatch profile (action head + state adapter).
@@ -101,17 +130,91 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         )
 
         # 5) RL heads/params (optional value head + Gaussian log-std).
+        hidden_size = (
+            infer_hidden_size(starvla_model)
+            if add_value_head or add_q_head
+            else None
+        )
         self.value_head: Optional[nn.Module] = None
         if add_value_head:
-            hidden_size = infer_hidden_size(starvla_model)
-            self.value_head = nn.Linear(hidden_size, 1).to(dtype=policy_param_dtype)
+            # The head is randomly initialized and optimized separately from
+            # the policy.  Keeping its two small tensors in FP32 avoids losing
+            # 1e-4-scale critic updates to the BF16 checkpoint grid.
+            self.value_head = StarVLAValueHead(
+                hidden_size, 1, dtype=torch.float32
+            )
 
-        self.actor_logstd = nn.Parameter(
-            torch.full((self.action_dim,), -2.5, dtype=policy_param_dtype)
+        self.q_head: Optional[nn.Module] = None
+        if add_q_head:
+            action_feature_dim = (
+                self.num_executed_action_chunks * self.action_dim
+            )
+            self.q_head = StarVLAMultiQHead(
+                hidden_size=hidden_size,
+                action_feature_dim=action_feature_dim,
+                hidden_dims=[int(dim) for dim in q_hidden_dims],
+                num_q_heads=int(num_q_heads),
+            ).to(dtype=torch.float32)
+            # Sparse binary RoboCasa returns have an initial value of zero. A
+            # zero output layer prevents arbitrary random Q bootstraps while
+            # preserving trainable hidden layers and independent twin critics.
+            for critic in self.q_head.qs:
+                nn.init.zeros_(critic.net[-1].weight)
+                if critic.net[-1].bias is not None:
+                    nn.init.zeros_(critic.net[-1].bias)
+        self.sac_task_description = (
+            None
+            if sac_task_description is None
+            else str(sac_task_description).strip()
         )
 
-        # 6) Rollout/training caches.
-        self._rollout_prompt_seq_len: Optional[int] = None
+        action_model = getattr(starvla_model, "action_model", None)
+        action_param_dtype = next(
+            (
+                p.dtype
+                for p in action_model.parameters()
+                if p.is_floating_point()
+            ),
+            policy_param_dtype,
+        ) if isinstance(action_model, nn.Module) else policy_param_dtype
+        actor_logstd = torch.full(
+            (self.action_dim,), float(initial_logstd), dtype=action_param_dtype
+        )
+        self._configured_fixed_actor_logstd = (
+            None if trainable_logstd else float(initial_logstd)
+        )
+        if trainable_logstd:
+            self.actor_logstd = nn.Parameter(actor_logstd)
+        else:
+            # FSDP with ``use_orig_params=False`` cannot flatten a module that
+            # mixes trainable and frozen parameters. A persistent buffer keeps
+            # the exploration scale fixed while retaining it in state_dicts and
+            # actor-to-rollout weight synchronization.
+            self.register_buffer("actor_logstd", actor_logstd, persistent=True)
+
+        # 6) Rollout/training caches. When supplied, this must match or exceed
+        # the tokenized prompt. Using the exact fixed length keeps rollout and
+        # actor replay on the same numerical computation path.
+        self._rollout_prompt_seq_len = (
+            None if rollout_prompt_seq_len is None else int(rollout_prompt_seq_len)
+        )
+        if (
+            self._rollout_prompt_seq_len is not None
+            and self._rollout_prompt_seq_len <= 0
+        ):
+            raise ValueError("rollout_prompt_seq_len must be positive when provided")
+
+    @torch.no_grad()
+    def restore_configured_fixed_actor_logstd(self) -> None:
+        """Restore the configured exploration scale after checkpoint loading.
+
+        Older RL checkpoints persist ``actor_logstd`` even when it is a fixed
+        buffer. Loading one of those checkpoints must not silently override a
+        new run's explicitly configured exploration scale.
+        """
+        if self._configured_fixed_actor_logstd is None:
+            return
+        self.actor_logstd.fill_(self._configured_fixed_actor_logstd)
 
     @property
     def uses_state_input(self) -> bool:
@@ -137,7 +240,120 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         """
         if forward_type == ForwardType.DEFAULT:
             return self.default_forward(**kwargs)
+        if forward_type == ForwardType.SAC:
+            return self.sac_forward(**kwargs)
+        if forward_type == ForwardType.SAC_Q:
+            return self.sac_q_forward(**kwargs)
         raise NotImplementedError(f"Unsupported forward_type: {forward_type}")
+
+    def _run_sac_oft_policy(
+        self, obs: dict[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.distributions.Normal, dict]:
+        """Run the pretrained OFT actor from raw replay-buffer observations."""
+        if self.action_head_type != "oft":
+            raise NotImplementedError(
+                "StarVLA SAC currently supports only the OFT action head, got "
+                f"{self.action_head_type!r}"
+            )
+        if not isinstance(obs, dict) or "main_images" not in obs:
+            raise ValueError("StarVLA SAC requires obs['main_images']")
+
+        sac_obs = dict(obs)
+        if not sac_obs.get("task_descriptions"):
+            if not self.sac_task_description:
+                raise ValueError(
+                    "StarVLA SAC replay observations do not store strings; set "
+                    "actor.model.sac_task_description"
+                )
+            batch_size = int(sac_obs["main_images"].shape[0])
+            sac_obs["task_descriptions"] = [self.sac_task_description] * batch_size
+
+        if self.policy_setup == "gr1":
+            from .utils.vlm_preprocess import get_train_image_size
+
+            target_size = get_train_image_size(self.starvla_model)
+            if target_size:
+                sac_obs = data_pipeline_utils.resize_env_obs_images_cv2(
+                    sac_obs, target_size
+                )
+
+        examples = data_pipeline_utils.build_examples_from_env_obs(
+            env_obs=sac_obs,
+            state_adapter_name=self.state_adapter_type,
+            prepare_state_tensor=partial(
+                state_utils.prepare_state_tensor,
+                starvla_model=self.starvla_model,
+                default_state_adapter_name=self.state_adapter_type,
+            ),
+            include_state=self.uses_state_input,
+        )
+        from .action_heads.oft import _build_oft_vlm_inputs, _run_oft_backbone_and_head
+
+        model_inputs = _build_oft_vlm_inputs(
+            self.starvla_model,
+            num_action_chunks=self.num_action_chunks,
+            examples=examples,
+        )
+        mean_actions, last_hidden, dist = _run_oft_backbone_and_head(
+            self,
+            model_inputs=model_inputs,
+            use_cache=False,
+        )
+        return mean_actions, last_hidden, dist, model_inputs
+
+    @staticmethod
+    def _pool_sac_features(
+        last_hidden: torch.Tensor, attention_mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        if attention_mask is None:
+            return last_hidden[:, -1]
+        attention_mask = attention_mask.to(device=last_hidden.device)
+        indices = attention_mask.long().sum(dim=1) - 1
+        rows = torch.arange(last_hidden.shape[0], device=last_hidden.device)
+        return last_hidden[rows, indices]
+
+    def sac_forward(
+        self, obs: dict[str, Any], mode: str = "train", **kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample differentiable environment-space action chunks for SAC."""
+        del kwargs
+        mean_actions, last_hidden, dist, model_inputs = self._run_sac_oft_policy(obs)
+        normalized_actions = mean_actions if mode == "eval" else dist.rsample()
+        env_actions = action_space_utils.unnormalize_actions_for_env_torch(
+            normalized_actions,
+            self._action_norm_stats,
+            policy_setup=self.policy_setup,
+        )
+        logprobs = dist.log_prob(normalized_actions).sum(dim=(-1, -2))
+        features = self._pool_sac_features(
+            last_hidden, model_inputs.get("attention_mask")
+        )
+        return env_actions, logprobs.to(torch.float32), features
+
+    def sac_q_forward(
+        self,
+        obs: dict[str, Any],
+        actions: torch.Tensor,
+        shared_feature: Optional[torch.Tensor] = None,
+        detach_encoder: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Evaluate twin Q heads on a raw observation and action chunk."""
+        del kwargs
+        if self.q_head is None:
+            raise RuntimeError("StarVLA SAC_Q requires actor.model.add_q_head=true")
+        if shared_feature is None:
+            _, last_hidden, _, model_inputs = self._run_sac_oft_policy(obs)
+            shared_feature = self._pool_sac_features(
+                last_hidden, model_inputs.get("attention_mask")
+            )
+        if detach_encoder:
+            shared_feature = shared_feature.detach()
+        actions = actions.reshape(actions.shape[0], -1)
+        q_dtype = next(self.q_head.parameters()).dtype
+        return self.q_head(
+            shared_feature.to(dtype=q_dtype), actions.to(dtype=q_dtype)
+        )
 
     def default_forward(
         self,
@@ -220,6 +436,17 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
                   'forward_inputs' for training replay.
         """
         del return_obs
+        if self.value_head is None:
+            calculate_values = False
+
+        if self.policy_setup == "gr1":
+            from .utils.vlm_preprocess import get_train_image_size
+
+            target_size = get_train_image_size(self.starvla_model)
+            if target_size:
+                env_obs = data_pipeline_utils.resize_env_obs_images_cv2(
+                    env_obs, target_size
+                )
 
         # Build examples based on env_obs and state adapter.
         examples = data_pipeline_utils.build_examples_from_env_obs(
@@ -333,9 +560,10 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             raise ValueError(
                 f"Action dim mismatch: model returns {act_dim}, expected {self.action_dim}"
             )
-        if n_chunks != self.num_action_chunks:
+        if n_chunks != self.num_executed_action_chunks:
             raise ValueError(
-                f"num_action_chunks mismatch: model returns {n_chunks}, expected {self.num_action_chunks}"
+                "Executed action-chunk mismatch: model returns "
+                f"{n_chunks}, expected {self.num_executed_action_chunks}"
             )
         env_chunk_actions = action_space_utils.unnormalize_actions_for_env(
             normalized_actions=normalized_actions.astype(np.float32),

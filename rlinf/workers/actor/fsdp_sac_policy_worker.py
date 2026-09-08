@@ -350,7 +350,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             discount = self.cfg.algorithm.gamma**num_action_chunks
             rewards_for_bootstrap = batch["rewards"][:, 0:1].to(self.torch_dtype)
         else:
-            discount = self.cfg.algorithm.gamma
+            if self.cfg.actor.model.model_type == "starvla":
+                executed_chunks = self.cfg.actor.model.get(
+                    "num_executed_action_chunks",
+                    self.cfg.actor.model.get("num_action_chunks", 1),
+                )
+                discount = self.cfg.algorithm.gamma**int(executed_chunks)
+            else:
+                discount = self.cfg.algorithm.gamma
             rewards_for_bootstrap = (
                 batch["rewards"].sum(dim=-1, keepdim=True).to(self.torch_dtype)
             )
@@ -383,7 +390,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     forward_type=ForwardType.SAC_Q,
                     obs=next_obs,
                     actions=next_state_actions,
-                    shared_feature=None,
+                    shared_feature=(
+                        shared_feature
+                        if self.cfg.actor.model.model_type == "starvla"
+                        else None
+                    ),
                     **dsrl_kwargs,
                 )
                 if self.critic_subsample_size > 0:
@@ -430,6 +441,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 forward_type=ForwardType.SAC_Q,
                 obs=curr_obs,
                 actions=actions,
+                # StarVLA reuses the frozen VLM representation as critic
+                # state.  The critic optimizer owns only q_head parameters;
+                # detaching here prevents critic gradients from leaking into
+                # the action head and contaminating global gradient clipping.
+                detach_encoder=self.cfg.actor.model.model_type == "starvla",
                 **dsrl_kwargs,
             )
         else:
@@ -494,7 +510,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 forward_type=ForwardType.SAC_Q,
                 obs=curr_obs,
                 actions=pi,
-                shared_feature=None,
+                shared_feature=(
+                    shared_feature
+                    if self.cfg.actor.model.model_type == "starvla"
+                    else None
+                ),
                 detach_encoder=True,
                 **dsrl_kwargs,
             )
@@ -566,6 +586,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 drq.apply_drq(batch["next_obs"], pad=4)
             train_micro_batch_list[i] = batch
 
+        # Optimizer.step() deliberately leaves gradients populated. Clear both
+        # parameter sets at the start of every critic pass so the FSDP-wide
+        # norm below measures only this critic update.
+        self.optimizer.zero_grad()
         self.qf_optimizer.zero_grad()
         gbs_critic_loss = []
         all_critic_metrics = {}
@@ -594,6 +618,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
         if self.update_step % self.critic_actor_ratio == 0 and train_actor:
             self.optimizer.zero_grad()
+            self.qf_optimizer.zero_grad()
             gbs_actor_loss = []
             gbs_entropy = []
             all_actor_metrics = {}
@@ -604,6 +629,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 gbs_actor_loss.append(actor_loss.item() * self.gradient_accumulation)
                 gbs_entropy.append(entropy.item())
                 append_to_dict(all_actor_metrics, q_metrics)
+            # The actor needs dQ/da, but the Q parameters themselves are not
+            # part of the actor optimizer. Backward still materializes their
+            # gradients, so clear those before the FSDP-wide actor norm/clip.
+            self.qf_optimizer.zero_grad()
             all_actor_metrics = {
                 f"actor/{key}": np.mean(value)
                 for key, value in all_actor_metrics.items()
@@ -757,6 +786,36 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.load_optimizer(self.device)
             self.is_optimizer_offloaded = False
 
+        # FSDP local-state checkpoints are pathological for StarVLA's partial
+        # fine-tuning layout: the frozen, unwrapped VLM is replicated into each
+        # rank file. The target model is another full copy, so a single SAC
+        # checkpoint can exceed 150 GB. For StarVLA, save one rank-0 full state
+        # (needed by deterministic evaluation) and reconstruct target Q / replay
+        # state if a watchdog has to resume after a crash. The uninterrupted run
+        # keeps optimizer, target, and replay state in memory as usual.
+        lightweight_starvla = (
+            self.cfg.actor.model.model_type == "starvla"
+            and self.cfg.algorithm.get("lightweight_starvla_checkpoint", True)
+        )
+        if lightweight_starvla:
+            model_save_path = os.path.join(save_base_path, "model_state_dict")
+            os.makedirs(model_save_path, exist_ok=True)
+            model_state_dict = self._strategy.get_model_state_dict(
+                self.model, cpu_offload=True, full_state_dict=True
+            )
+            if self._rank == 0:
+                torch.save(
+                    model_state_dict,
+                    os.path.join(model_save_path, "full_weights.pt"),
+                )
+                torch.save(
+                    {"step": int(step), "update_step": int(self.update_step)},
+                    os.path.join(save_base_path, "sac_resume_state.pt"),
+                )
+            del model_state_dict
+            torch.distributed.barrier()
+            return
+
         # Save model
         self._strategy.save_checkpoint(
             model=self.model,
@@ -800,6 +859,44 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.replay_buffer.save_checkpoint(buffer_save_path)
 
     def load_checkpoint(self, load_base_path):
+        lightweight_path = os.path.join(
+            load_base_path, "model_state_dict", "full_weights.pt"
+        )
+        if (
+            self.cfg.actor.model.model_type == "starvla"
+            and os.path.isfile(lightweight_path)
+            and not os.path.isdir(
+                os.path.join(load_base_path, "local_shard_checkpoint")
+            )
+        ):
+            model_state_dict = torch.load(
+                lightweight_path,
+                map_location="cpu",
+                mmap=True,
+                weights_only=True,
+            )
+            self._strategy.load_model_with_state_dict(
+                self.model,
+                model_state_dict,
+                cpu_offload=True,
+                full_state_dict=True,
+            )
+            del model_state_dict
+            resume_state_path = os.path.join(
+                load_base_path, "sac_resume_state.pt"
+            )
+            if os.path.isfile(resume_state_path):
+                resume_state = torch.load(
+                    resume_state_path, map_location="cpu", weights_only=True
+                )
+                self.update_step = int(resume_state.get("update_step", 0))
+            # The lightweight emergency-resume format intentionally resets
+            # Adam moments and replay contents. Start the target critic from the
+            # restored online Q instead of loading eight redundant model copies.
+            self.soft_update_target_model(tau=1.0)
+            torch.distributed.barrier()
+            return
+
         # load model
         self._strategy.load_checkpoint(
             model=self.model,

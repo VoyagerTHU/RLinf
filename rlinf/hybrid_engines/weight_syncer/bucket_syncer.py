@@ -85,7 +85,11 @@ def iter_named_tensor_buckets(
         bucket[key] = tensor.to(
             device=bucket_device,
             dtype=transport_dtype,
-            non_blocking=True,
+            # A CPU/Gloo consumer does not participate in the CUDA stream that
+            # enqueued this copy. Returning the bucket before D2H completion can
+            # therefore expose partially copied model weights to the channel.
+            # Accelerator transports remain asynchronous.
+            non_blocking=bucket_device.type != "cpu",
         )
         currently_hold += bucket[key].numel() * bucket[key].element_size()
 

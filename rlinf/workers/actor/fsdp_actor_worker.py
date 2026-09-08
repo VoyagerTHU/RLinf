@@ -29,7 +29,12 @@ from torch.utils._pytree import tree_map
 import rlinf.algorithms  # noqa: F401
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
+    compute_embodied_reference_kl,
     kl_penalty,
+    positive_advantage_sample_mask,
+    prioritize_positive_advantage_samples,
+    retain_positive_advantages,
+    should_stop_ppo_update,
 )
 from rlinf.config import SupportedModel, torch_dtype_from_precision
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
@@ -985,6 +990,25 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         self.enable_offload = self.cfg.actor.get("enable_offload", False)
         self.entropy_op_type = self.cfg.algorithm.get("entropy_op_type", "torch")
+        self.kl_beta = float(self.cfg.algorithm.get("kl_beta", 0.0))
+        self.kl_penalty_type = str(
+            self.cfg.algorithm.get(
+                "kl_penalty_type",
+                self.cfg.algorithm.get("kl_penalty", "low_var_kl"),
+            )
+        )
+        self.combine_reference_model = bool(
+            self.cfg.actor.get("combine_reference_model", True)
+        )
+        if self.kl_beta < 0:
+            raise ValueError(f"algorithm.kl_beta must be non-negative, got {self.kl_beta}.")
+        if self.kl_beta > 0 and not self.combine_reference_model:
+            raise NotImplementedError(
+                "EmbodiedFSDPActor currently requires actor.combine_reference_model=true "
+                "when algorithm.kl_beta is positive."
+            )
+        self.ref_policy_state_dict = None
+        self.offload_model_buffer = None
 
         # Sync weight comm options
         max_ctas = cfg.rollout.get("sync_weight_nccl_max_ctas", None)
@@ -1027,6 +1051,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         self.setup_model_and_optimizer()
 
+        if self.kl_beta > 0:
+            # Keep the model loaded from actor.model.model_path as an immutable
+            # reference.  The runner restores resume checkpoints only after
+            # init_worker(), so resumed training remains anchored to the same
+            # original pretrained policy rather than to the latest checkpoint.
+            self.ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model)
+            self.offload_model_buffer = {}
+
         if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
@@ -1038,11 +1070,74 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if model is None:
             model = super().model_provider_func()
 
+        trainable_prefixes = self.cfg.actor.get(
+            "trainable_parameter_prefixes", None
+        )
+        if trainable_prefixes:
+            if not self.cfg.actor.fsdp_config.get("use_orig_params", False):
+                raise ValueError(
+                    "actor.trainable_parameter_prefixes requires "
+                    "actor.fsdp_config.use_orig_params=true so FSDP can mix "
+                    "frozen and trainable parameters safely"
+                )
+            if isinstance(trainable_prefixes, str):
+                trainable_prefixes = [trainable_prefixes]
+            prefixes = tuple(
+                str(prefix).strip().rstrip(".")
+                for prefix in trainable_prefixes
+                if str(prefix).strip()
+            )
+            if not prefixes:
+                raise ValueError(
+                    "actor.trainable_parameter_prefixes must contain a non-empty prefix"
+                )
+
+            total_parameters = sum(param.numel() for param in model.parameters())
+            trainable_parameters = 0
+            matched_names = []
+            for name, param in model.named_parameters():
+                is_trainable = any(
+                    name == prefix or name.startswith(f"{prefix}.")
+                    for prefix in prefixes
+                )
+                param.requires_grad_(is_trainable)
+                if is_trainable:
+                    trainable_parameters += param.numel()
+                    matched_names.append(name)
+            if not matched_names:
+                raise ValueError(
+                    "No model parameters matched actor.trainable_parameter_prefixes="
+                    f"{list(prefixes)}"
+                )
+            self._logger.info(
+                "[FSDP] Parameter whitelist enabled: prefixes=%s, "
+                "trainable=%d/%d (%.4f%%), tensors=%d",
+                list(prefixes),
+                trainable_parameters,
+                total_parameters,
+                100.0 * trainable_parameters / total_parameters,
+                len(matched_names),
+            )
+
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
             model.load_state_dict(model_dict)
+            restore_fixed_logstd = getattr(
+                model, "restore_configured_fixed_actor_logstd", None
+            )
+            if restore_fixed_logstd is not None:
+                restore_fixed_logstd()
 
         return model
+
+    def load_checkpoint(self, load_path: str) -> None:
+        """Load training state while honoring a configured fixed log standard deviation."""
+        super().load_checkpoint(load_path)
+        restore_fixed_logstd = getattr(
+            self.model, "restore_configured_fixed_actor_logstd", None
+        )
+        if restore_fixed_logstd is not None:
+            restore_fixed_logstd()
 
     def get_rollout_state_dict(self) -> dict:
         return self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
@@ -1229,6 +1324,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if kwargs["loss_mask_sum"] is not None:
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
+        if self.cfg.algorithm.get("positive_advantages_only", False):
+            self.rollout_batch["advantages"] = retain_positive_advantages(
+                self.rollout_batch["advantages"],
+                self.rollout_batch.get("loss_mask", None),
+            )
+
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
         return rollout_metrics
 
@@ -1319,6 +1420,344 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 f"sft_loss_weight={self.sft_loss_weight:.6f}"
             )
 
+    @torch.no_grad()
+    def _recompute_rollout_logprobs_on_actor(self) -> dict[str, float]:
+        """Recompute old-policy log-probabilities with the training actor.
+
+        Rollout and FSDP actor workers can produce slightly different action
+        means even when they hold the same logical weights. Small exploration
+        standard deviations amplify that numerical difference in PPO ratios.
+        Replaying sampled actions once on the actor makes the stored old policy
+        and subsequent update forwards use the same numerical path.
+        """
+        enabled = bool(
+            self.cfg.algorithm.get("recompute_rollout_logprobs_on_actor", False)
+        )
+        metrics = {
+            "actor/recomputed_rollout_logprobs": float(enabled),
+            "actor/recompute_rollout_logprobs_seconds": 0.0,
+            "actor/rollout_actor_logprob_mean_abs_delta": 0.0,
+            "actor/rollout_actor_logprob_max_abs_delta": 0.0,
+        }
+        if not enabled:
+            return metrics
+
+        rollout_logprobs = self.rollout_batch["prev_logprobs"]
+        rollout_size = rollout_logprobs.shape[0]
+        micro_batch_size = int(
+            self.cfg.algorithm.get(
+                "actor_logprob_recompute_micro_batch_size",
+                self.cfg.algorithm.get(
+                    "reference_forward_micro_batch_size",
+                    self.cfg.actor.micro_batch_size,
+                ),
+            )
+        )
+        if micro_batch_size <= 0:
+            raise ValueError(
+                "algorithm.actor_logprob_recompute_micro_batch_size must be "
+                f"positive, got {micro_batch_size}."
+            )
+        if rollout_size % micro_batch_size != 0:
+            raise ValueError(
+                "Flattened rollout size must be divisible by the actor log-prob "
+                f"recompute micro-batch size: {rollout_size} vs {micro_batch_size}."
+            )
+
+        start_time = time.perf_counter()
+        replay_batches = split_dict_to_chunk(
+            self.rollout_batch, rollout_size // micro_batch_size
+        )
+        actor_logprobs = []
+        self.model.eval()
+        for replay_batch in replay_batches:
+            replay_batch = put_tensor_device(
+                replay_batch,
+                f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
+            )
+            with self.amp_context:
+                output_dict = self.model(
+                    forward_inputs=replay_batch.get("forward_inputs", None),
+                    compute_logprobs=True,
+                    compute_entropy=False,
+                    compute_values=False,
+                    use_cache=False,
+                )
+            actor_logprobs.append(
+                output_dict["logprobs"].detach().to(device="cpu").contiguous()
+            )
+            del replay_batch, output_dict
+
+        actor_logprobs = torch.cat(actor_logprobs, dim=0)
+        rollout_logprobs = rollout_logprobs.detach().to(device="cpu")
+        if actor_logprobs.shape != rollout_logprobs.shape:
+            raise RuntimeError(
+                "Actor-recomputed and rollout log-probability shapes differ: "
+                f"{actor_logprobs.shape} vs {rollout_logprobs.shape}."
+            )
+        delta = actor_logprobs.float() - rollout_logprobs.float()
+        if not torch.isfinite(delta).all():
+            raise RuntimeError(
+                "Non-finite actor-vs-rollout log-probability delta detected."
+            )
+        self.rollout_batch["prev_logprobs"] = actor_logprobs
+        metrics.update(
+            {
+                "actor/recompute_rollout_logprobs_seconds": (
+                    time.perf_counter() - start_time
+                ),
+                "actor/rollout_actor_logprob_mean_abs_delta": (
+                    delta.abs().mean().item()
+                ),
+                "actor/rollout_actor_logprob_max_abs_delta": (
+                    delta.abs().max().item()
+                ),
+            }
+        )
+        self.model.train()
+        clear_memory(sync=False)
+        return metrics
+
+    @torch.no_grad()
+    def _compute_post_update_logprob_metrics(self) -> dict[str, float]:
+        """Measure the realized policy movement after optimizer updates.
+
+        Pre-update PPO KL is necessarily zero for a single-minibatch update.
+        Replaying the rollout after the optimizer step makes update magnitude
+        observable and catches both ineffective sub-ULP updates and excessive
+        policy movement.
+        """
+        enabled = bool(
+            self.cfg.algorithm.get("audit_post_update_logprobs", False)
+        )
+        metrics = {
+            "actor/post_update_logprob_audit": float(enabled),
+            "actor/post_update_logprob_audit_seconds": 0.0,
+            "actor/post_update_logprob_finite_fraction": 1.0,
+            "actor/post_update_ratio_finite_fraction": 1.0,
+            "actor/post_update_logprob_mean_delta": 0.0,
+            "actor/post_update_logprob_mean_abs_delta": 0.0,
+            "actor/post_update_logprob_max_abs_delta": 0.0,
+            "actor/post_update_ratio_mean_abs_delta": 0.0,
+            "actor/post_update_ratio_max_abs_delta": 0.0,
+            "actor/post_update_reference_logprob_mean_abs_delta": 0.0,
+            "actor/post_update_reference_logprob_max_abs_delta": 0.0,
+        }
+        if not enabled:
+            return metrics
+
+        rollout_size = self.rollout_batch["prev_logprobs"].shape[0]
+        micro_batch_size = int(
+            self.cfg.algorithm.get(
+                "post_update_logprob_audit_micro_batch_size",
+                self.cfg.algorithm.get(
+                    "actor_logprob_recompute_micro_batch_size",
+                    self.cfg.actor.micro_batch_size,
+                ),
+            )
+        )
+        if micro_batch_size <= 0 or rollout_size % micro_batch_size != 0:
+            raise ValueError(
+                "The post-update log-probability audit micro-batch size must be "
+                f"positive and divide {rollout_size}, got {micro_batch_size}."
+            )
+
+        start_time = time.perf_counter()
+        replay_batches = split_dict_to_chunk(
+            self.rollout_batch, rollout_size // micro_batch_size
+        )
+        device = Worker.torch_platform.current_device()
+        sums = torch.zeros(8, dtype=torch.float64, device=device)
+        maxima = torch.zeros(3, dtype=torch.float64, device=device)
+
+        self.model.eval()
+        for replay_batch in replay_batches:
+            replay_batch = put_tensor_device(
+                replay_batch,
+                f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
+            )
+            with self.amp_context:
+                output_dict = self.model(
+                    forward_inputs=replay_batch.get("forward_inputs", None),
+                    compute_logprobs=True,
+                    compute_entropy=False,
+                    compute_values=False,
+                    use_cache=False,
+                )
+
+            current = output_dict["logprobs"].float()
+            previous = replay_batch["prev_logprobs"].to(current).float()
+            delta = (current - previous).reshape(current.shape[0], -1)
+            loss_mask = replay_batch.get("loss_mask", None)
+            if loss_mask is not None:
+                flat_mask = loss_mask.bool().reshape(loss_mask.shape[0], -1)
+                if flat_mask.shape[1] == 1:
+                    flat_mask = flat_mask.expand_as(delta)
+                elif flat_mask.shape != delta.shape:
+                    raise RuntimeError(
+                        "Post-update audit cannot broadcast loss_mask "
+                        f"{flat_mask.shape} to logprobs {delta.shape}."
+                    )
+                delta = delta[flat_mask]
+            else:
+                delta = delta.reshape(-1)
+
+            sums[0] += delta.numel()
+            finite_delta = torch.isfinite(delta)
+            sums[1] += finite_delta.sum()
+            finite_values = delta[finite_delta].double()
+            if finite_values.numel() > 0:
+                abs_values = finite_values.abs()
+                sums[2] += finite_values.sum()
+                sums[3] += abs_values.sum()
+                maxima[0] = torch.maximum(maxima[0], abs_values.max())
+                ratio_delta = torch.expm1(finite_values)
+                finite_ratio = torch.isfinite(ratio_delta)
+                sums[5] += finite_ratio.sum()
+                if finite_ratio.any():
+                    abs_ratio_delta = ratio_delta[finite_ratio].abs()
+                    sums[4] += abs_ratio_delta.sum()
+                    maxima[1] = torch.maximum(maxima[1], abs_ratio_delta.max())
+
+            reference = replay_batch.get("ref_logprobs", None)
+            if reference is not None:
+                reference_delta = (
+                    current - reference.to(current).float()
+                ).reshape(current.shape[0], -1)
+                if loss_mask is not None:
+                    reference_delta = reference_delta[flat_mask]
+                else:
+                    reference_delta = reference_delta.reshape(-1)
+                finite_reference = reference_delta[
+                    torch.isfinite(reference_delta)
+                ].double()
+                sums[7] += finite_reference.numel()
+                if finite_reference.numel() > 0:
+                    abs_reference = finite_reference.abs()
+                    sums[6] += abs_reference.sum()
+                    maxima[2] = torch.maximum(maxima[2], abs_reference.max())
+
+            del replay_batch, output_dict
+
+        torch.distributed.all_reduce(sums, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(maxima, op=torch.distributed.ReduceOp.MAX)
+        total = max(sums[0].item(), 1.0)
+        finite_count = max(sums[1].item(), 1.0)
+        ratio_finite_count = max(sums[5].item(), 1.0)
+        reference_count = max(sums[7].item(), 1.0)
+        metrics.update(
+            {
+                "actor/post_update_logprob_audit_seconds": (
+                    time.perf_counter() - start_time
+                ),
+                "actor/post_update_logprob_finite_fraction": (
+                    sums[1].item() / total
+                ),
+                "actor/post_update_ratio_finite_fraction": (
+                    sums[5].item() / finite_count
+                ),
+                "actor/post_update_logprob_mean_delta": (
+                    sums[2].item() / finite_count
+                ),
+                "actor/post_update_logprob_mean_abs_delta": (
+                    sums[3].item() / finite_count
+                ),
+                "actor/post_update_logprob_max_abs_delta": maxima[0].item(),
+                "actor/post_update_ratio_mean_abs_delta": (
+                    sums[4].item() / ratio_finite_count
+                ),
+                "actor/post_update_ratio_max_abs_delta": maxima[1].item(),
+                "actor/post_update_reference_logprob_mean_abs_delta": (
+                    sums[6].item() / reference_count
+                ),
+                "actor/post_update_reference_logprob_max_abs_delta": (
+                    maxima[2].item()
+                ),
+            }
+        )
+        self.model.train()
+        clear_memory(sync=False)
+        return metrics
+
+    def _actor_logstd_metrics(self) -> dict[str, float]:
+        """Return the runtime exploration scale for checkpoint/config auditing."""
+        actor_logstd = None
+        for name, value in list(self.model.named_parameters()) + list(
+            self.model.named_buffers()
+        ):
+            if name == "actor_logstd" or name.endswith(".actor_logstd"):
+                actor_logstd = value
+                break
+        if actor_logstd is None:
+            return {}
+        values = actor_logstd.detach().float()
+        return {
+            "actor/runtime_logstd_min": values.min().item(),
+            "actor/runtime_logstd_mean": values.mean().item(),
+            "actor/runtime_logstd_max": values.max().item(),
+        }
+
+    @torch.no_grad()
+    def _compute_reference_logprobs(self) -> float:
+        """Replay the received rollout once under the immutable reference policy."""
+        if self.kl_beta <= 0:
+            return 0.0
+        if self.ref_policy_state_dict is None:
+            raise RuntimeError(
+                "Reference policy weights are missing while algorithm.kl_beta is positive."
+            )
+
+        rollout_size = self.rollout_batch["prev_logprobs"].shape[0]
+        reference_micro_batch_size = int(
+            self.cfg.algorithm.get(
+                "reference_forward_micro_batch_size", self.cfg.actor.micro_batch_size
+            )
+        )
+        if reference_micro_batch_size <= 0:
+            raise ValueError(
+                "algorithm.reference_forward_micro_batch_size must be positive, "
+                f"got {reference_micro_batch_size}."
+            )
+        if rollout_size % reference_micro_batch_size != 0:
+            raise ValueError(
+                "Flattened rollout size must be divisible by the reference forward "
+                f"micro-batch size: {rollout_size} vs {reference_micro_batch_size}."
+            )
+
+        start_time = time.perf_counter()
+        reference_batches = split_dict_to_chunk(
+            self.rollout_batch, rollout_size // reference_micro_batch_size
+        )
+        reference_logprobs = []
+        self.model.eval()
+        with cpu_weight_swap(
+            self.model,
+            self.ref_policy_state_dict,
+            self.offload_model_buffer,
+        ):
+            for reference_batch in reference_batches:
+                reference_batch = put_tensor_device(
+                    reference_batch,
+                    f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
+                )
+                with self.amp_context:
+                    output_dict = self.model(
+                        forward_inputs=reference_batch.get("forward_inputs", None),
+                        compute_logprobs=True,
+                        compute_entropy=False,
+                        compute_values=False,
+                        use_cache=False,
+                    )
+                reference_logprobs.append(
+                    output_dict["logprobs"].detach().to(device="cpu").contiguous()
+                )
+                del reference_batch, output_dict
+
+        self.rollout_batch["ref_logprobs"] = torch.cat(reference_logprobs, dim=0)
+        self.model.train()
+        clear_memory(sync=False)
+        return time.perf_counter() - start_time
+
     @Worker.timer("run_training")
     def run_training(self) -> None:
         """
@@ -1337,11 +1776,33 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         g = torch.Generator()
         g.manual_seed(self.cfg.actor.seed + self._rank)
         shuffle_id = torch.randperm(rollout_size, generator=g)
+        prioritize_positive_samples = bool(
+            self.cfg.algorithm.get("prioritize_positive_advantage_samples", False)
+        )
+        if prioritize_positive_samples:
+            if not self.cfg.algorithm.get("positive_advantages_only", False):
+                raise ValueError(
+                    "algorithm.prioritize_positive_advantage_samples requires "
+                    "algorithm.positive_advantages_only=true."
+                )
+            shuffle_id = prioritize_positive_advantage_samples(
+                self.rollout_batch["advantages"],
+                shuffle_id,
+                self.rollout_batch.get("loss_mask", None),
+            )
+
+        positive_chunk_samples_available = positive_advantage_sample_mask(
+            self.rollout_batch["advantages"],
+            self.rollout_batch.get("loss_mask", None),
+        ).sum().item()
 
         with torch.no_grad():
             self.rollout_batch = process_nested_dict_for_train(
                 self.rollout_batch, shuffle_id
             )
+
+        recompute_logprob_metrics = self._recompute_rollout_logprobs_on_actor()
+        reference_forward_seconds = self._compute_reference_logprobs()
 
         assert (
             self.cfg.actor.global_batch_size
@@ -1364,6 +1825,35 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
         metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
+        target_kl = self.cfg.algorithm.get("target_kl", None)
+        if target_kl is not None:
+            target_kl = float(target_kl)
+            # Validate before any optimizer work is performed.
+            should_stop_ppo_update(0.0, target_kl)
+        reference_target_kl = self.cfg.algorithm.get("reference_target_kl", None)
+        if reference_target_kl is not None:
+            reference_target_kl = float(reference_target_kl)
+            should_stop_ppo_update(0.0, reference_target_kl)
+        max_optimizer_steps_per_update = self.cfg.algorithm.get(
+            "max_optimizer_steps_per_update", None
+        )
+        if max_optimizer_steps_per_update is not None:
+            max_optimizer_steps_per_update = int(max_optimizer_steps_per_update)
+            if max_optimizer_steps_per_update <= 0:
+                raise ValueError(
+                    "algorithm.max_optimizer_steps_per_update must be positive "
+                    "when configured."
+                )
+        optimizer_steps_this_update = 0
+        early_stopped_on_kl = False
+        stopped_on_optimizer_step_limit = False
+        first_global_batch_kl = None
+        last_global_batch_kl = 0.0
+        max_global_batch_abs_kl = 0.0
+        first_global_batch_reference_kl = None
+        last_global_batch_reference_kl = 0.0
+        max_global_batch_reference_kl = 0.0
+        positive_chunk_samples_this_update = 0
         for _ in range(update_epoch):
             rollout_dataloader_iter = split_dict_to_chunk(
                 self.rollout_batch,
@@ -1385,8 +1875,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     train_global_batch,
                     train_global_batch_size // self.cfg.actor.micro_batch_size,
                 )
+                train_global_positive_chunk_samples = (
+                    train_global_batch["advantages"]
+                    .reshape(train_global_batch_size, -1)
+                    .gt(0)
+                    .any(dim=-1)
+                    .sum()
+                    .item()
+                )
 
                 self.optimizer.zero_grad()
+                global_batch_kl_sum = torch.zeros(
+                    (), device=Worker.torch_platform.current_device()
+                )
+                global_batch_abs_kl_sum = torch.zeros_like(global_batch_kl_sum)
+                global_batch_reference_kl_sum = torch.zeros_like(global_batch_kl_sum)
                 for idx, batch in enumerate(train_micro_batch):
                     batch = put_tensor_device(
                         batch,
@@ -1464,6 +1967,37 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     }
                     loss, metrics_data = policy_loss(**kwargs)
 
+                    reference_kl_loss = torch.tensor(
+                        0.0, device=Worker.torch_platform.current_device()
+                    )
+                    if self.kl_beta > 0:
+                        ref_logprobs = batch.get("ref_logprobs", None)
+                        if ref_logprobs is None:
+                            raise RuntimeError(
+                                "Reference log-probabilities were not attached to the "
+                                "embodied rollout batch."
+                            )
+                        reference_kl_loss = compute_embodied_reference_kl(
+                            output_dict["logprobs"],
+                            ref_logprobs,
+                            kl_penalty_type=self.kl_penalty_type,
+                            logprob_type=self.cfg.algorithm.logprob_type,
+                            single_action_dim=self.cfg.actor.model.get("action_dim", 7),
+                            loss_mask=loss_mask,
+                        )
+                        loss = loss + self.kl_beta * reference_kl_loss
+                    metrics_data["actor/reference_kl_loss"] = (
+                        reference_kl_loss.detach().item()
+                    )
+                    micro_batch_kl = torch.as_tensor(
+                        metrics_data["actor/approx_kl"],
+                        device=global_batch_kl_sum.device,
+                        dtype=torch.float32,
+                    ).detach()
+                    global_batch_kl_sum += micro_batch_kl
+                    global_batch_abs_kl_sum += micro_batch_kl.abs()
+                    global_batch_reference_kl_sum += reference_kl_loss.detach()
+
                     entropy_loss = torch.tensor(
                         0.0, device=Worker.torch_platform.current_device()
                     )
@@ -1497,7 +2031,65 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                 self.torch_platform.empty_cache()
 
+                num_micro_batches = len(train_micro_batch)
+                global_batch_kl = global_batch_kl_sum / num_micro_batches
+                global_batch_abs_kl = global_batch_abs_kl_sum / num_micro_batches
+                global_batch_reference_kl = (
+                    global_batch_reference_kl_sum / num_micro_batches
+                )
+                torch.distributed.all_reduce(
+                    global_batch_kl, op=torch.distributed.ReduceOp.AVG
+                )
+                torch.distributed.all_reduce(
+                    global_batch_abs_kl, op=torch.distributed.ReduceOp.AVG
+                )
+                torch.distributed.all_reduce(
+                    global_batch_reference_kl, op=torch.distributed.ReduceOp.AVG
+                )
+                global_batch_kl_value = global_batch_kl.item()
+                global_batch_abs_kl_value = global_batch_abs_kl.item()
+                global_batch_reference_kl_value = global_batch_reference_kl.item()
+                if first_global_batch_kl is None:
+                    first_global_batch_kl = global_batch_kl_value
+                if first_global_batch_reference_kl is None:
+                    first_global_batch_reference_kl = (
+                        global_batch_reference_kl_value
+                    )
+                last_global_batch_kl = global_batch_kl_value
+                last_global_batch_reference_kl = global_batch_reference_kl_value
+                max_global_batch_abs_kl = max(
+                    max_global_batch_abs_kl, global_batch_abs_kl_value
+                )
+                max_global_batch_reference_kl = max(
+                    max_global_batch_reference_kl,
+                    global_batch_reference_kl_value,
+                )
+
+                exceeded_proximal_kl = should_stop_ppo_update(
+                    global_batch_abs_kl_value, target_kl
+                )
+                exceeded_reference_kl = should_stop_ppo_update(
+                    global_batch_reference_kl_value, reference_target_kl
+                )
+                if exceeded_proximal_kl or exceeded_reference_kl:
+                    early_stopped_on_kl = True
+                    self.optimizer.zero_grad()
+                    self._logger.warning(
+                        "Skipping the pending optimizer step and stopping remaining PPO "
+                        "minibatches because a KL boundary was exceeded: proximal "
+                        "abs KL=%.6f (target=%s), reference KL=%.6f (target=%s).",
+                        global_batch_abs_kl_value,
+                        target_kl,
+                        global_batch_reference_kl_value,
+                        reference_target_kl,
+                    )
+                    break
+
                 grad_norm, lr_list = self.optimizer_step()
+                optimizer_steps_this_update += 1
+                positive_chunk_samples_this_update += (
+                    train_global_positive_chunk_samples * self._world_size
+                )
                 data = {
                     "actor/grad_norm": grad_norm,
                     "actor/lr": lr_list[0],
@@ -1505,13 +2097,114 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 if len(lr_list) > 1:
                     data["critic/lr"] = lr_list[1]
                 append_to_dict(metrics, data)
-        # put LR scheduler step here
-        self.lr_scheduler.step()
+                if (
+                    max_optimizer_steps_per_update is not None
+                    and optimizer_steps_this_update
+                    >= max_optimizer_steps_per_update
+                ):
+                    stopped_on_optimizer_step_limit = True
+                    self._logger.info(
+                        "Stopping remaining PPO minibatches after the configured "
+                        "optimizer-step limit (%d).",
+                        max_optimizer_steps_per_update,
+                    )
+                    break
+            if early_stopped_on_kl or stopped_on_optimizer_step_limit:
+                break
+        append_to_dict(
+            metrics,
+            {
+                "actor/first_global_batch_kl": (
+                    first_global_batch_kl
+                    if first_global_batch_kl is not None
+                    else 0.0
+                ),
+                "actor/last_global_batch_kl": last_global_batch_kl,
+                "actor/max_global_batch_abs_kl": max_global_batch_abs_kl,
+                "actor/first_global_batch_reference_kl": (
+                    first_global_batch_reference_kl
+                    if first_global_batch_reference_kl is not None
+                    else 0.0
+                ),
+                "actor/last_global_batch_reference_kl": (
+                    last_global_batch_reference_kl
+                ),
+                "actor/max_global_batch_reference_kl": (
+                    max_global_batch_reference_kl
+                ),
+                "actor/optimizer_steps_this_update": optimizer_steps_this_update,
+                "actor/optimizer_chunk_samples_this_update": (
+                    optimizer_steps_this_update * self.cfg.actor.global_batch_size
+                ),
+                "actor/positive_chunk_samples_available": (
+                    positive_chunk_samples_available * self._world_size
+                ),
+                "actor/positive_chunk_samples_this_update": (
+                    positive_chunk_samples_this_update
+                ),
+                "actor/prioritized_positive_advantage_samples": float(
+                    prioritize_positive_samples
+                ),
+                "actor/optimizer_mean_passes_over_rollout": (
+                    optimizer_steps_this_update
+                    * batch_size_per_rank
+                    / rollout_size
+                ),
+                "actor/early_stopped_on_kl": float(early_stopped_on_kl),
+                "actor/stopped_on_optimizer_step_limit": float(
+                    stopped_on_optimizer_step_limit
+                ),
+                "actor/reference_forward_seconds": reference_forward_seconds,
+            },
+        )
+        append_to_dict(metrics, recompute_logprob_metrics)
+        post_update_logprob_metrics = self._compute_post_update_logprob_metrics()
+        append_to_dict(metrics, post_update_logprob_metrics)
+        append_to_dict(metrics, self._actor_logstd_metrics())
+        # Keep the LR schedule aligned with actual parameter updates. A KL
+        # rejection can skip every pending optimizer step in this rollout.
+        if optimizer_steps_this_update > 0:
+            self.lr_scheduler.step()
         self.optimizer.zero_grad()
         clear_memory()
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
+        )
+        self.log_on_first_rank(
+            "Embodied actor KL/update summary: "
+            f"proximal_first={mean_metric_dict['actor/first_global_batch_kl']:.9g}, "
+            f"proximal_last={mean_metric_dict['actor/last_global_batch_kl']:.9g}, "
+            f"proximal_max_abs={mean_metric_dict['actor/max_global_batch_abs_kl']:.9g}, "
+            "reference_first="
+            f"{mean_metric_dict['actor/first_global_batch_reference_kl']:.9g}, "
+            "reference_last="
+            f"{mean_metric_dict['actor/last_global_batch_reference_kl']:.9g}, "
+            "reference_max="
+            f"{mean_metric_dict['actor/max_global_batch_reference_kl']:.9g}, "
+            f"optimizer_steps={mean_metric_dict['actor/optimizer_steps_this_update']:.9g}, "
+            "optimizer_chunk_samples="
+            f"{mean_metric_dict['actor/optimizer_chunk_samples_this_update']:.9g}, "
+            "positive_chunk_samples="
+            f"{mean_metric_dict['actor/positive_chunk_samples_this_update']:.9g}/"
+            f"{mean_metric_dict['actor/positive_chunk_samples_available']:.9g}, "
+            "prioritized_positive_samples="
+            f"{mean_metric_dict['actor/prioritized_positive_advantage_samples']:.9g}, "
+            "optimizer_mean_passes_over_rollout="
+            f"{mean_metric_dict['actor/optimizer_mean_passes_over_rollout']:.9g}, "
+            f"early_stopped={mean_metric_dict['actor/early_stopped_on_kl']:.9g}, "
+            "stopped_on_optimizer_step_limit="
+            f"{mean_metric_dict['actor/stopped_on_optimizer_step_limit']:.9g}, "
+            "recomputed_rollout_logprobs="
+            f"{mean_metric_dict['actor/recomputed_rollout_logprobs']:.9g}, "
+            "rollout_actor_logprob_mean_abs_delta="
+            f"{mean_metric_dict['actor/rollout_actor_logprob_mean_abs_delta']:.9g}, "
+            "post_update_logprob_mean_abs_delta="
+            f"{mean_metric_dict['actor/post_update_logprob_mean_abs_delta']:.9g}, "
+            "post_update_ratio_mean_abs_delta="
+            f"{mean_metric_dict['actor/post_update_ratio_mean_abs_delta']:.9g}, "
+            f"reference_forward_seconds="
+            f"{mean_metric_dict['actor/reference_forward_seconds']:.9g}"
         )
 
         return mean_metric_dict

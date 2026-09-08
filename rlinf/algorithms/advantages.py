@@ -121,6 +121,84 @@ def compute_grpo_advantages(
     return advantages, None
 
 
+@register_advantage("temporal_grpo")
+def compute_temporal_grpo_advantages(
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor,
+    dones: torch.Tensor,
+    group_size: int,
+    gamma: float = 1.0,
+    **kwargs,
+):
+    """Compute per-chunk GRPO advantages from discounted reward-to-go.
+
+    Standard embodied GRPO first reduces every trajectory to one scalar score,
+    then broadcasts its normalized group advantage to every action chunk. That
+    is particularly noisy for long manipulation episodes: one late failure can
+    push otherwise-correct early actions away from the base policy.
+
+    Temporal GRPO retains the reward timeline. It computes reward-to-go at each
+    chunk and normalizes those returns across trajectories from the same seed
+    at the same chunk. Completed trajectories are excluded from later group
+    statistics through ``loss_mask``.
+    """
+    if rewards.ndim != 2:
+        raise ValueError(
+            f"temporal_grpo expects rewards shaped [time, batch], got {rewards.shape}"
+        )
+    if loss_mask is None or loss_mask.shape != rewards.shape:
+        raise ValueError(
+            "temporal_grpo requires loss_mask with the same [time, batch] shape "
+            f"as rewards, got {None if loss_mask is None else loss_mask.shape}"
+        )
+    if dones.ndim != 2 or dones.shape != (rewards.shape[0] + 1, rewards.shape[1]):
+        raise ValueError(
+            "temporal_grpo expects dones shaped [time + 1, batch], got "
+            f"{dones.shape} for rewards {rewards.shape}"
+        )
+    if rewards.shape[1] % group_size != 0:
+        raise ValueError(
+            f"Batch size {rewards.shape[1]} is not divisible by group_size "
+            f"{group_size}"
+        )
+    gamma = float(gamma)
+    if not 0.0 <= gamma <= 1.0:
+        raise ValueError(f"temporal_grpo gamma must be in [0, 1], got {gamma}")
+
+    returns = torch.zeros_like(rewards)
+    running_return = torch.zeros_like(rewards[0])
+    for step in reversed(range(rewards.shape[0])):
+        running_return = rewards[step] + (
+            gamma * running_return * (~dones[step + 1])
+        )
+        returns[step] = running_return
+
+    num_groups = rewards.shape[1] // group_size
+    grouped_returns = returns.reshape(returns.shape[0], num_groups, group_size)
+    grouped_mask = loss_mask.bool().reshape(
+        loss_mask.shape[0], num_groups, group_size
+    )
+    valid_count = grouped_mask.sum(dim=-1, keepdim=True)
+    safe_count = valid_count.clamp(min=1).to(dtype=returns.dtype)
+    group_mean = (grouped_returns * grouped_mask).sum(
+        dim=-1, keepdim=True
+    ) / safe_count
+    centered = (grouped_returns - group_mean) * grouped_mask
+    # Match torch.std's sample-standard-deviation convention used by GRPO.
+    variance = centered.square().sum(dim=-1, keepdim=True) / (
+        (valid_count - 1).clamp(min=1).to(dtype=returns.dtype)
+    )
+    group_std = variance.sqrt()
+    informative = (valid_count > 1) & (group_std > 1e-6)
+    grouped_advantages = torch.where(
+        informative,
+        centered / (group_std + 1e-6),
+        torch.zeros_like(centered),
+    )
+    advantages = grouped_advantages.reshape_as(returns) * loss_mask
+    return advantages, None
+
+
 @register_advantage("grpo_dynamic")
 def compute_grpo_dynamic_advantages(
     rewards: torch.Tensor,

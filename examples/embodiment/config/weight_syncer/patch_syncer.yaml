@@ -8,4 +8,8 @@ patch:
   init_sync:
     enabled: True
     prefixes: null
+    # Optional name fragments for sparse trainable subtrees such as PEFT
+    # adapters (for example: [.lora_A., .lora_B.]). Prefix and substring
+    # selectors are combined with OR; leaving both null syncs the full model.
+    name_substrings: null
     bucket_size: 134217728

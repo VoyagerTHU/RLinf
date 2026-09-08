@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from typing import Any, Optional
 
 import numpy as np
+import torch
 
 
 def resolve_action_norm_stats(
@@ -28,6 +29,7 @@ def resolve_action_norm_stats(
     unnorm_key: Optional[str],
     action_dim: int,
     action_stats_source: Optional[str] = None,
+    preserve_float64: bool = False,
 ) -> Optional[dict[str, np.ndarray]]:
     """Resolve action normalization stats from starVLA.
 
@@ -97,8 +99,9 @@ def resolve_action_norm_stats(
         )
 
     try:
-        high = np.asarray(high_src, dtype=np.float32).reshape(-1)
-        low = np.asarray(low_src, dtype=np.float32).reshape(-1)
+        stats_dtype = np.float64 if preserve_float64 else np.float32
+        high = np.asarray(high_src, dtype=stats_dtype).reshape(-1)
+        low = np.asarray(low_src, dtype=stats_dtype).reshape(-1)
     except Exception as exc:
         raise RuntimeError(
             "starVLA action norm stats are not numeric arrays; cannot unnormalize actions "
@@ -186,20 +189,68 @@ def unnormalize_actions_for_env(
             "Set cfg.unnorm_key=None to use normalized actions directly."
         )
 
-    try:
-        from starVLA.model.framework.base_framework import baseframework
-    except Exception as exc:
-        raise ModuleNotFoundError(
-            "starVLA is required for action unnormalization but is not importable."
-        ) from exc
-
     actions = np.asarray(normalized_actions, dtype=np.float32)
     flat = actions.reshape(-1, actions.shape[-1]).astype(np.float32, copy=False)
+    resolved_platform = str(policy_setup or "").strip().lower()
+    stats_dtype = None if resolved_platform == "gr1" else np.float32
     starvla_stats = {
-        "q99": np.asarray(action_norm_stats["q99"], dtype=np.float32),
-        "q01": np.asarray(action_norm_stats["q01"], dtype=np.float32),
+        "q99": np.asarray(action_norm_stats["q99"], dtype=stats_dtype),
+        "q01": np.asarray(action_norm_stats["q01"], dtype=stats_dtype),
         "mask": np.asarray(action_norm_stats["mask"], dtype=bool),
     }
-    env_flat = baseframework.unnormalize_actions(flat, starvla_stats)
-    env_actions = np.asarray(env_flat, dtype=np.float32).reshape(actions.shape)
+    if resolved_platform == "gr1":
+        # RoboCasa-GR1 uses all 29 channels as continuous arm, hand, and waist
+        # controls.  In particular, channel 6 is a left-arm joint rather than
+        # the binary gripper channel assumed by baseframework's LIBERO helper.
+        # Match examples/Robocasa_tabletop/model2robocasa_interface.py exactly.
+        clipped = np.clip(flat, -1, 1)
+        high = starvla_stats["q99"]
+        low = starvla_stats["q01"]
+        env_flat = np.where(
+            starvla_stats["mask"],
+            (clipped + 1) / 2 * (high - low) + low,
+            clipped,
+        )
+    else:
+        try:
+            from starVLA.model.framework.base_framework import baseframework
+        except Exception as exc:
+            raise ModuleNotFoundError(
+                "starVLA is required for action unnormalization but is not importable."
+            ) from exc
+        env_flat = baseframework.unnormalize_actions(flat, starvla_stats)
+    output_dtype = None if resolved_platform == "gr1" else np.float32
+    env_actions = np.asarray(env_flat, dtype=output_dtype).reshape(actions.shape)
     return _gripper_mapping(env_actions, policy_setup=policy_setup)
+
+
+def unnormalize_actions_for_env_torch(
+    normalized_actions: torch.Tensor,
+    action_norm_stats: dict[str, np.ndarray],
+    policy_setup: Optional[str] = None,
+) -> torch.Tensor:
+    """Differentiably map normalized actions into the environment action space.
+
+    This path is used by continuous-control actor losses such as SAC, where the
+    environment-space action must retain a gradient back to the policy mean.
+    RoboCasa GR1 uses a purely affine min/max transform over all 29 channels.
+    The discontinuous LIBERO gripper remapping is deliberately unsupported.
+    """
+    if action_norm_stats is None:
+        raise RuntimeError("Missing action_norm_stats for torch unnormalization")
+
+    resolved_platform = str(policy_setup or "").strip().lower()
+    if resolved_platform != "gr1":
+        raise NotImplementedError(
+            "Differentiable StarVLA action unnormalization currently supports "
+            f"only policy_setup='gr1', got {policy_setup!r}"
+        )
+
+    actions = normalized_actions.clamp(-1.0, 1.0)
+    dtype = actions.dtype
+    device = actions.device
+    high = torch.as_tensor(action_norm_stats["q99"], device=device, dtype=dtype)
+    low = torch.as_tensor(action_norm_stats["q01"], device=device, dtype=dtype)
+    mask = torch.as_tensor(action_norm_stats["mask"], device=device, dtype=torch.bool)
+    scaled = (actions + 1.0) * 0.5 * (high - low) + low
+    return torch.where(mask, scaled, actions)

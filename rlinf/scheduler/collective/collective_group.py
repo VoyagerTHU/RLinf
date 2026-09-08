@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import io
 import itertools
 import logging
@@ -39,6 +40,13 @@ from .async_work import AsyncFuncWork, AsyncWork
 
 if TYPE_CHECKING:
     from .collective import Collective
+
+
+# torch.distributed process-group creation mutates process-global c10d state and
+# is not thread-safe. A ChannelWorker can initialize several peer groups from
+# independent communication threads, so the per-CollectiveGroup lock below is
+# insufficient to protect that shared state.
+_PROCESS_GROUP_INIT_LOCK = threading.Lock()
 
 
 @dataclass
@@ -903,50 +911,62 @@ class CollectiveGroup:
     ) -> dist.ProcessGroup:
         """Initialize the process group for collective operations."""
         with self._lock:
-            self._init_group()
-            if self._mc_group.is_initialized:
-                return
+            with _PROCESS_GROUP_INIT_LOCK:
+                self._init_group()
+                if self._mc_group.is_initialized:
+                    return
 
-            from ..cluster import Cluster
+                from ..cluster import Cluster
 
-            if self._rank == 0:
-                master_port = self._worker.acquire_free_port()
-                self._coll_manager.set_master_port_info(
-                    self._group_info.group_name, master_port
+                if self._rank == 0:
+                    master_port = self._worker.acquire_free_port()
+                    self._coll_manager.set_master_port_info(
+                        self._group_info.group_name, master_port
+                    )
+                else:
+                    master_port = None
+                    count = 0
+                    while master_port is None:
+                        master_port = self._coll_manager.get_master_port_info(
+                            self._group_info.group_name
+                        )
+                        time.sleep(0.001)
+                        count += 1
+                        if count % Cluster.TIMEOUT_WARN_TIME == 0:
+                            self._logger.warning(
+                                f"Waiting for master port for collective group {self._group_info.group_name} to be set for {count // 1000} seconds"
+                            )
+
+                self._logger.debug(
+                    f"Initializing process group for collective group {self._group_info.group_name}, master address {self._group_info.master_addr}, master port {master_port}, world size {self._group_info.world_size}, rank {self._rank}"
                 )
-            else:
-                master_port = None
-                count = 0
-                while master_port is None:
-                    master_port = self._coll_manager.get_master_port_info(
+
+                gc_was_enabled = gc.isenabled()
+                if gc_was_enabled:
+                    gc.disable()
+                try:
+                    self._mc_group.init(
+                        init_method=(
+                            f"tcp://{self._group_info.master_addr}:{master_port}"
+                        ),
+                        world_size=self._group_info.world_size,
+                        rank=self._rank,
+                        group_name=self._group_info.group_name,
+                        options=options,
+                    )
+                finally:
+                    if gc_was_enabled:
+                        gc.enable()
+
+                self._logger.debug(
+                    f"Process group {self._group_info.group_name} initialized successfully."
+                )
+
+                if self._rank == 0:
+                    # Avoid using the same master port for the next group
+                    self._coll_manager.reset_master_port_info(
                         self._group_info.group_name
                     )
-                    time.sleep(0.001)
-                    count += 1
-                    if count % Cluster.TIMEOUT_WARN_TIME == 0:
-                        self._logger.warning(
-                            f"Waiting for master port for collective group {self._group_info.group_name} to be set for {count // 1000} seconds"
-                        )
-
-            self._logger.debug(
-                f"Initializing process group for collective group {self._group_info.group_name}, master address {self._group_info.master_addr}, master port {master_port}, world size {self._group_info.world_size}, rank {self._rank}"
-            )
-
-            self._mc_group.init(
-                init_method=f"tcp://{self._group_info.master_addr}:{master_port}",
-                world_size=self._group_info.world_size,
-                rank=self._rank,
-                group_name=self._group_info.group_name,
-                options=options,
-            )
-
-            self._logger.debug(
-                f"Process group {self._group_info.group_name} initialized successfully."
-            )
-
-            if self._rank == 0:
-                # Avoid using the same master port for the next group
-                self._coll_manager.reset_master_port_info(self._group_info.group_name)
 
     def _partition_tensors(
         self, tensors: list[torch.Tensor]

@@ -16,6 +16,7 @@ import typing
 
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
+from rlinf.runners.embodied_runner import EmbodiedRunner
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
 from rlinf.utils.metric_logger import MetricLogger
@@ -29,6 +30,11 @@ if typing.TYPE_CHECKING:
 
 
 class EmbodiedEvalRunner:
+    _ROLLOUT_IDENTITY_FIELDS = EmbodiedRunner._ROLLOUT_IDENTITY_FIELDS
+    _metric_values = staticmethod(EmbodiedRunner._metric_values)
+    _without_rollout_identity = EmbodiedRunner._without_rollout_identity
+    _log_seed_rollout_table = EmbodiedRunner._log_seed_rollout_table
+
     def __init__(
         self,
         cfg: "DictConfig",
@@ -71,6 +77,11 @@ class EmbodiedEvalRunner:
         env_results = env_handle.wait()
         rollout_handle.wait()
         eval_metrics_list = [results for results in env_results if results is not None]
+        eval_step = int(self.cfg.runner.get("eval_step", 0))
+        self._log_seed_rollout_table(
+            eval_metrics_list, step=eval_step, mode="eval"
+        )
+        eval_metrics_list = self._without_rollout_identity(eval_metrics_list)
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
         return eval_metrics
 
@@ -78,6 +89,8 @@ class EmbodiedEvalRunner:
         eval_metrics = self.evaluate()
         eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
         self.logger.info(eval_metrics)
-        self.metric_logger.log(step=0, data=eval_metrics)
+        self.metric_logger.log(
+            step=int(self.cfg.runner.get("eval_step", 0)), data=eval_metrics
+        )
 
         self.metric_logger.finish()

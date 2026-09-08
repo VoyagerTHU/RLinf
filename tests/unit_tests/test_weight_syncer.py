@@ -608,6 +608,59 @@ def test_patch_weight_syncer_init_sync_bootstraps_selected_prefixes():
         )
 
 
+def test_patch_weight_syncer_init_sync_selects_lora_name_substrings():
+    device = _get_cuda_device()
+    sender_model = _make_value_head_model(device)
+    sender_state = {
+        "backbone.base_layer.weight": sender_model.backbone.weight,
+        "backbone.lora_A.default.weight": torch.full((2, 4), 3.0, device=device),
+        "backbone.lora_B.default.weight": torch.full((4, 2), 5.0, device=device),
+    }
+    receiver_state = {
+        key: torch.zeros_like(value) for key, value in sender_state.items()
+    }
+    transport = _InMemoryDuplexTransport()
+    kwargs = {
+        "snapshot_device": "cpu",
+        "transport_device": "cpu",
+        "init_sync_enabled": True,
+        "init_sync_prefixes": None,
+        "init_sync_name_substrings": [".lora_A.", ".lora_B."],
+        "init_sync_bucket_size": 32,
+    }
+    sender_syncer = PatchWeightSyncer(**kwargs)
+    receiver_syncer = PatchWeightSyncer(**kwargs)
+
+    async def _run() -> None:
+        sender_init = asyncio.create_task(
+            sender_syncer.init_sender(
+                sender_state,
+                transport.sender_send,
+                transport.sender_recv,
+            )
+        )
+        receiver_init = asyncio.create_task(
+            receiver_syncer.init_receiver(
+                receiver_state,
+                transport.receiver_recv,
+                transport.receiver_send,
+            )
+        )
+        await asyncio.gather(sender_init, receiver_init)
+
+    asyncio.run(_run())
+
+    torch.testing.assert_close(
+        receiver_state["backbone.lora_A.default.weight"],
+        sender_state["backbone.lora_A.default.weight"],
+    )
+    torch.testing.assert_close(
+        receiver_state["backbone.lora_B.default.weight"],
+        sender_state["backbone.lora_B.default.weight"],
+    )
+    assert torch.count_nonzero(receiver_state["backbone.base_layer.weight"]).item() == 0
+
+
 def test_patch_weight_syncer_init_sync_bootstraps_full_state_dict():
     device = _get_cuda_device()
     sender_model = _make_bucket_dtype_model(device)
@@ -660,6 +713,29 @@ def test_patch_weight_syncer_init_sync_bootstraps_full_state_dict():
     _assert_state_dict_equal(
         _clone_state_dict(sender_model), _clone_state_dict(receiver_model)
     )
+
+
+def test_named_tensor_buckets_use_blocking_copy_for_cpu_transport(monkeypatch):
+    """CPU transport must not expose a bucket before its tensor copy is ready."""
+    calls: list[bool] = []
+    original_to = torch.Tensor.to
+
+    def record_to(self, *args, **kwargs):
+        calls.append(kwargs.get("non_blocking", False))
+        return original_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", record_to)
+    buckets = list(
+        iter_named_tensor_buckets(
+            [("weight", torch.ones(2, 2))],
+            version=0,
+            bucket_size=1024,
+            bucket_device="cpu",
+        )
+    )
+
+    assert len(buckets) == 1
+    assert calls == [False]
 
 
 def test_patch_weight_syncer_preserves_nonfloating_buffers():
@@ -1100,6 +1176,7 @@ def test_weight_syncer_factory_builds_patch_and_bucket():
                 "init_sync": {
                     "enabled": True,
                     "prefixes": ["value_head"],
+                    "name_substrings": [".lora_A."],
                     "bucket_size": 4096,
                 },
             },
@@ -1109,6 +1186,7 @@ def test_weight_syncer_factory_builds_patch_and_bucket():
     assert isinstance(patch_syncer, PatchWeightSyncer)
     assert patch_syncer.init_sync_enabled is True
     assert patch_syncer.init_sync_prefixes == ["value_head"]
+    assert patch_syncer.init_sync_name_substrings == [".lora_A."]
     assert patch_syncer.init_sync_bucket_size == 4096
 
     bucket_cfg = OmegaConf.create(

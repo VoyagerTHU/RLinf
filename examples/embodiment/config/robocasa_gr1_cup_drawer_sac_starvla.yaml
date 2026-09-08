@@ -1,0 +1,244 @@
+defaults:
+  - env/robocasa_gr1_cup_drawer@env.train
+  - env/robocasa_gr1_cup_drawer@env.eval
+  - model/starvla@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,rollout: 0-7
+    env: 0-3
+
+runner:
+  task_type: embodied
+  weight_sync_interval: 1
+  logger:
+    log_path: ${oc.env:ROBOCASA_GR1_SAC_LOG_ROOT,/data/dengyixuan/wyz/experiments/rlinf_starvla_robocasa_gr1_sac}
+    project_name: rlinf-starvla-robocasa-gr1
+    experiment_name: cup_to_drawer_close_sac_actionhead_twinq
+    logger_backends: [wandb]
+  max_epochs: 60
+  max_steps: 60
+  only_eval: false
+  val_check_interval: -1
+  save_interval: 5
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  normalize_advantages: false
+  group_size: 1
+  reward_coef: 1.0
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: chunk_level
+  adv_type: embodied_sac
+  loss_type: embodied_sac
+  loss_agg_func: token-mean
+  update_epoch: 2
+
+  # Each policy call executes 12 physical actions. The SAC worker raises this
+  # per-action discount to the executed horizon for its one-step Q target.
+  # 0.999 per physical control step becomes ~0.988 per 12-action chunk. Using
+  # 0.99 here would become 0.886 per chunk and nearly erase a sparse terminal
+  # reward across a RoboCasa episode.
+  gamma: 0.999
+  tau: 0.005
+  target_update_freq: 1
+  target_update_type: q_head_only
+  lightweight_starvla_checkpoint: true
+  bootstrap_type: standard
+  backup_entropy: false
+  agg_q: min
+  actor_agg_q: min
+  q_head_type: default
+  critic_subsample_size: -1
+  critic_actor_ratio: 2
+  train_actor_steps: 2
+  enable_drq: false
+
+  entropy_tuning:
+    # Exploration is the same fixed logstd=-3.5 used in the GRPO/PPO runs.
+    # A fixed, small alpha avoids an ill-scaled automatic target over the
+    # 12x29-dimensional action chunk during this first SAC experiment.
+    alpha_type: fixed_alpha
+    initial_alpha: 0.001
+    optim:
+      lr: 1.0e-4
+      lr_scheduler: torch_constant
+      clip_grad: 10.0
+
+  replay_buffer:
+    enable_cache: true
+    cache_size: 10
+    sample_window_size: 10
+    min_buffer_size: 1
+    auto_save: false
+
+  sampling_params:
+    do_sample: true
+    temperature_train: 1.0
+    temperature_eval: 1.0
+    top_k: 0
+    top_p: 1.0
+    repetition_penalty: 1.0
+    add_BOS: false
+  length_params:
+    max_new_token: 256
+    max_length: 1024
+    min_length: 1
+
+env:
+  group_name: EnvGroup
+  enable_offload: false
+  train:
+    total_num_envs: 32
+    group_size: 1
+    auto_reset: false
+    ignore_terminations: false
+    seed_manifest: /data/dengyixuan/wyz/experiments/rlinf_starvla_robocasa_gr1_ppo_officialbase_actionhead_valuehead_train50_disjoint_eval5_logstdm35_r128_mb4_lr1e6_vlr1e4_klpenalty_notarget_20260827/train_seed_manifest.json
+    seed_pool_size: 50
+    seed_sampler_seed: 20260820
+    reward_coef: ${algorithm.reward_coef}
+    subtask_reward_shaping:
+      enabled: false
+      grasp_object: 0.1
+      obj_in_drawer: 0.5
+      success: 1.0
+    renderer_backend: nvidia
+    llvmpipe_threads: null
+    action_steps_per_chunk: 12
+    max_episode_steps: 720
+    max_steps_per_rollout_epoch: 720
+    video_cfg:
+      save_video: true
+      info_on_video: true
+      fps: 20
+      extra_info_on_video:
+        - episode.success_once
+        - episode.grasped_once
+        - episode.obj_in_drawer_once
+        - episode.sample_seed
+      video_base_dir: ${runner.logger.log_path}/video/train
+  eval:
+    total_num_envs: 56
+    group_size: 1
+    is_eval: true
+    seed_manifest: ${oc.env:REPO_PATH}/examples/embodiment/config/seeds/robocasa_gr1_cup_drawer_eval_50.json
+    seed_pool_size: 50
+    eval_seed_count: 50
+    action_steps_per_chunk: 12
+    max_episode_steps: 720
+    max_steps_per_rollout_epoch: 720
+    renderer_backend: mesa
+    mesa_egl_device: 8
+    llvmpipe_threads: 1
+    video_cfg:
+      save_video: true
+      info_on_video: true
+      fps: 20
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: RolloutGroup
+  generation_backend: huggingface
+  training_sampling_seed: 20260824
+  recompute_logprobs: false
+  unnorm_key: ${actor.model.unnorm_key}
+  enable_offload: false
+  pipeline_stage_num: 1
+  inference_micro_batch_size: 4
+  collect_transitions: true
+  collect_prev_infos: false
+  model:
+    model_path: ${actor.model.model_path}
+    precision: ${actor.model.precision}
+
+weight_syncer:
+  patch:
+    init_sync:
+      enabled: true
+      prefixes: [starvla_model.action_model, actor_logstd]
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  trainable_parameter_prefixes: [starvla_model.action_model, q_head]
+  micro_batch_size: 4
+  global_batch_size: 256
+  seed: 42
+  enable_offload: false
+  model:
+    model_path: /data/dengyixuan/wyz/models/StarVLA/Qwen3-VL-OFT-Robocasa/checkpoints/steps_90000_pytorch_model.pt
+    model_type: starvla
+    precision: bf16
+    action_model_precision: fp32
+    action_dim: 29
+    num_action_chunks: 16
+    num_executed_action_chunks: 12
+    rollout_prompt_seq_len: 155
+    num_steps: 16
+    policy_setup: gr1
+    unnorm_key: gr1
+    action_stats_source: minmax
+    add_value_head: false
+    add_q_head: true
+    num_q_heads: 2
+    q_hidden_dims: [512, 256]
+    sac_task_description: pick the cup and place it in the drawer then close the drawer
+    initial_logstd: -3.5
+    trainable_logstd: false
+    use_proprio: false
+    starvla:
+      ckpt_path: ${actor.model.model_path}
+      framework_name: QwenOFT
+      expected_action_dim: ${actor.model.action_dim}
+      expected_num_action_chunks: ${actor.model.num_action_chunks}
+      expected_image_size: [224, 224]
+      enable_state_input: false
+  optim:
+    lr: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-5
+    weight_decay: 0.0
+    clip_grad: 2.0
+    lr_scheduler: constant
+  critic_optim:
+    lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-5
+    weight_decay: 0.0
+    clip_grad: 10.0
+    lr_scheduler: constant
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: full_shard
+    use_orig_params: true
+    gradient_checkpointing: false
+    mixed_precision:
+      param_dtype: null
+      reduce_dtype: null
+      buffer_dtype: null
+    wrap_policy:
+      module_classes_to_wrap: [L1RegressionActionHead, StarVLAMultiQHead]
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false

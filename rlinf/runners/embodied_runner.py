@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
 import queue
@@ -50,6 +51,11 @@ if TYPE_CHECKING:
 
 
 class EmbodiedRunner:
+    _ROLLOUT_IDENTITY_FIELDS = {
+        "sample_seed",
+        "sample_group",
+        "sample_trajectory",
+    }
     def __init__(
         self,
         cfg: DictConfig,
@@ -163,7 +169,7 @@ class EmbodiedRunner:
         actor_handle.wait()
         rollout_handle.wait()
 
-    def evaluate(self):
+    def evaluate(self, step: int | None = None):
         env_handle: Handle = self.env.evaluate(
             input_channel=self.env_channel,
             rollout_channel=self.rollout_channel,
@@ -175,8 +181,179 @@ class EmbodiedRunner:
         env_results = env_handle.wait()
         rollout_handle.wait()
         eval_metrics_list = [results for results in env_results if results is not None]
+        self._log_seed_rollout_table(
+            eval_metrics_list,
+            step=self.global_step if step is None else step,
+            mode="eval",
+        )
+        eval_metrics_list = self._without_rollout_identity(eval_metrics_list)
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
         return eval_metrics
+
+    def _without_rollout_identity(self, metrics_list: list[dict]) -> list[dict]:
+        return [
+            {
+                key: value
+                for key, value in metrics.items()
+                if key not in self._ROLLOUT_IDENTITY_FIELDS
+            }
+            for metrics in metrics_list
+        ]
+
+    @staticmethod
+    def _metric_values(metrics_list: list[dict], key: str) -> list:
+        values = []
+        for metrics in metrics_list:
+            value = metrics.get(key, None)
+            if value is None:
+                continue
+            if hasattr(value, "detach"):
+                value = value.detach().cpu().reshape(-1).tolist()
+            elif hasattr(value, "reshape"):
+                value = value.reshape(-1).tolist()
+            elif isinstance(value, (tuple, list)):
+                value = list(value)
+            else:
+                value = [value]
+            values.extend(value)
+        return values
+
+    def _log_seed_rollout_table(
+        self, metrics_list: list[dict], *, step: int, mode: str
+    ) -> None:
+        """Persist per-seed/per-trajectory outcomes and mirror them to W&B."""
+        seeds = self._metric_values(metrics_list, "sample_seed")
+        if not seeds:
+            return
+
+        groups = self._metric_values(metrics_list, "sample_group")
+        trajectories = self._metric_values(metrics_list, "sample_trajectory")
+        successes = self._metric_values(metrics_list, "success_once")
+        grasped = self._metric_values(metrics_list, "grasped_once")
+        in_drawer = self._metric_values(metrics_list, "obj_in_drawer_once")
+        grasp_steps = self._metric_values(metrics_list, "grasp_first_step")
+        drawer_steps = self._metric_values(
+            metrics_list, "obj_in_drawer_first_step"
+        )
+        success_steps = self._metric_values(metrics_list, "success_first_step")
+        episode_lengths = self._metric_values(metrics_list, "episode_len")
+        returns = self._metric_values(metrics_list, "return")
+        field_lengths = {
+            len(seeds),
+            len(groups),
+            len(trajectories),
+            len(successes),
+            len(episode_lengths),
+            len(returns),
+        }
+        if len(field_lengths) != 1:
+            raise RuntimeError(
+                f"Mismatched {mode} rollout table field lengths: {field_lengths}"
+            )
+        trajectory_count = len(seeds)
+        for name, values in (
+            ("grasped_once", grasped),
+            ("obj_in_drawer_once", in_drawer),
+            ("grasp_first_step", grasp_steps),
+            ("obj_in_drawer_first_step", drawer_steps),
+            ("success_first_step", success_steps),
+        ):
+            if values and len(values) != trajectory_count:
+                raise RuntimeError(
+                    f"Mismatched {mode} rollout table {name} field length: "
+                    f"{len(values)} != {trajectory_count}"
+                )
+
+        success_by_seed: dict[int, list[float]] = defaultdict(list)
+        for seed, success in zip(seeds, successes):
+            success_by_seed[int(seed)].append(float(success))
+        rate_by_seed = {
+            seed: sum(outcomes) / len(outcomes)
+            for seed, outcomes in success_by_seed.items()
+        }
+
+        def rates_by_seed(values: list) -> dict[int, float]:
+            outcomes_by_seed: dict[int, list[float]] = defaultdict(list)
+            for seed, outcome in zip(seeds, values):
+                outcomes_by_seed[int(seed)].append(float(outcome))
+            return {
+                seed: sum(outcomes) / len(outcomes)
+                for seed, outcomes in outcomes_by_seed.items()
+            }
+
+        grasp_rate_by_seed = rates_by_seed(grasped) if grasped else {}
+        drawer_rate_by_seed = rates_by_seed(in_drawer) if in_drawer else {}
+
+        task_name = str(
+            self.cfg.env.eval.task_name
+            if mode == "eval"
+            else self.cfg.env.train.task_name
+        )
+        rows = []
+        for row_index, (
+            seed,
+            group,
+            trajectory,
+            success,
+            episode_len,
+            episode_return,
+        ) in enumerate(
+            zip(
+                seeds,
+                groups,
+                trajectories,
+                successes,
+                episode_lengths,
+                returns,
+            )
+        ):
+            rows.append(
+                {
+                    "training_step": int(step),
+                    "mode": mode,
+                    "task": task_name,
+                    "seed": int(seed),
+                    "group_index": int(group),
+                    "trajectory_index": int(trajectory),
+                    "trajectory_success": float(success),
+                    "seed_success_rate": float(rate_by_seed[int(seed)]),
+                    "trajectory_grasped": (
+                        float(grasped[row_index]) if grasped else None
+                    ),
+                    "seed_grasp_rate": grasp_rate_by_seed.get(int(seed)),
+                    "trajectory_obj_in_drawer": (
+                        float(in_drawer[row_index]) if in_drawer else None
+                    ),
+                    "seed_obj_in_drawer_rate": drawer_rate_by_seed.get(int(seed)),
+                    "grasp_first_step": (
+                        int(grasp_steps[row_index]) if grasp_steps else None
+                    ),
+                    "obj_in_drawer_first_step": (
+                        int(drawer_steps[row_index]) if drawer_steps else None
+                    ),
+                    "success_first_step": (
+                        int(success_steps[row_index]) if success_steps else None
+                    ),
+                    "episode_length": int(episode_len),
+                    "episode_return": float(episode_return),
+                }
+            )
+
+        table_dir = os.path.join(self.cfg.runner.logger.log_path, "rollout_tables")
+        os.makedirs(table_dir, exist_ok=True)
+        jsonl_path = os.path.join(table_dir, f"{mode}_seed_rollouts.jsonl")
+        with open(jsonl_path, "a", encoding="utf-8") as output_file:
+            for row in rows:
+                output_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        if "wandb" in self.metric_logger.logger_backends:
+            import pandas as pd
+
+            self.metric_logger.log_table(
+                pd.DataFrame(rows),
+                name=f"{mode}/seed_rollouts",
+                step=int(step),
+            )
 
     def _log_ranked_metrics(
         self,
@@ -202,6 +379,32 @@ class EmbodiedRunner:
                 worker_group_name=worker_group_name,
                 rank=rank,
             )
+
+    def _log_step_metrics_jsonl(self, metrics: dict, step: int) -> None:
+        """Persist complete step metrics even when no remote logger is enabled."""
+        row = {
+            "training_step": int(step),
+            "completed_global_step": int(self.global_step),
+            "timestamp_unix": time.time(),
+        }
+        for key, value in metrics.items():
+            if hasattr(value, "detach"):
+                value = value.detach().cpu()
+            if hasattr(value, "item"):
+                value = value.item()
+            if isinstance(value, (bool, int, float, str)) or value is None:
+                row[key] = value
+                continue
+            try:
+                row[key] = float(value)
+            except (TypeError, ValueError):
+                row[key] = str(value)
+
+        metrics_dir = os.path.join(self.cfg.runner.logger.log_path, "metrics")
+        os.makedirs(metrics_dir, exist_ok=True)
+        jsonl_path = os.path.join(metrics_dir, "training_step_metrics.jsonl")
+        with open(jsonl_path, "a", encoding="utf-8") as output_file:
+            output_file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def _aggregate_numeric_metrics(self, metrics_list: list[dict] | None) -> dict:
         if not metrics_list:
@@ -275,6 +478,7 @@ class EmbodiedRunner:
             # set global step
             self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
+            self.env.set_global_step(self.global_step).wait()
 
             with self.timer("step"):
                 with self.timer("sync_weights"):
@@ -336,7 +540,7 @@ class EmbodiedRunner:
                 if run_val:
                     with self.timer("eval"):
                         self.update_rollout_weights()
-                        eval_metrics = self.evaluate()
+                        eval_metrics = self.evaluate(step=_step)
                         eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
                         self.metric_logger.log(data=eval_metrics, step=_step)
 
@@ -375,7 +579,12 @@ class EmbodiedRunner:
             env_results_list = [
                 results for results in env_results if results is not None
             ]
-            env_metrics = compute_evaluate_metrics(env_results_list)
+            self._log_seed_rollout_table(
+                env_results_list, step=_step, mode="train"
+            )
+            env_metrics = compute_evaluate_metrics(
+                self._without_rollout_identity(env_results_list)
+            )
             env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
             ranked_env_results = [
                 {"rank": rank, "env": rank_metrics}
@@ -452,6 +661,8 @@ class EmbodiedRunner:
             logging_metrics.update(env_metrics)
             logging_metrics.update(rollout_metrics)
             logging_metrics.update(training_metrics)
+
+            self._log_step_metrics_jsonl(logging_metrics, _step)
 
             self.print_metrics_table_async(
                 _step, self.max_steps, start_time, logging_metrics, start_step

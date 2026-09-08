@@ -12,9 +12,127 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Optional
 
 import torch
+
+
+def retain_positive_advantages(
+    advantages: torch.Tensor,
+    loss_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Keep only valid, strictly positive policy advantages.
+
+    Embodied GRPO already standardizes trajectory rewards within each seed
+    group.  Dropping the negative half turns the actor update into a
+    conservative best-of-group update: better-than-group trajectories are
+    reinforced, while failures do not push the policy away from sampled
+    actions that may only have failed because of exploration noise.
+
+    The immutable-reference KL term is computed separately and therefore
+    remains active for every sampled trajectory.
+    """
+    if loss_mask is not None and loss_mask.shape != advantages.shape:
+        raise ValueError(
+            "Positive-advantage loss mask must match advantages exactly: "
+            f"advantages={tuple(advantages.shape)}, "
+            f"loss_mask={tuple(loss_mask.shape)}."
+        )
+
+    positive = torch.clamp_min(advantages, 0)
+    if loss_mask is None:
+        return positive
+    return positive * loss_mask.to(device=advantages.device, dtype=advantages.dtype)
+
+
+def positive_advantage_sample_mask(
+    advantages: torch.Tensor,
+    loss_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return one boolean per embodied chunk sample with positive advantage.
+
+    Embodied rollout tensors use ``[time, batch, ...]`` before actor shuffling.
+    The actor flattens the first two axes into independent chunk samples, so the
+    same convention is used here when deciding which samples can contribute a
+    policy gradient.
+    """
+    if advantages.ndim < 2:
+        raise ValueError(
+            "Positive-advantage sample selection requires at least time and "
+            f"batch dimensions, got shape {tuple(advantages.shape)}."
+        )
+    if loss_mask is not None and loss_mask.shape != advantages.shape:
+        raise ValueError(
+            "Positive-advantage sample loss mask must match advantages exactly: "
+            f"advantages={tuple(advantages.shape)}, "
+            f"loss_mask={tuple(loss_mask.shape)}."
+        )
+
+    positive = advantages > 0
+    if loss_mask is not None:
+        positive &= loss_mask.to(device=advantages.device, dtype=torch.bool)
+    return positive.reshape(advantages.shape[0] * advantages.shape[1], -1).any(
+        dim=-1
+    )
+
+
+def prioritize_positive_advantage_samples(
+    advantages: torch.Tensor,
+    randomized_indices: torch.Tensor,
+    loss_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Stable-partition a random actor permutation so positive samples lead.
+
+    Random order is retained within both partitions. This lets a conservative
+    optimizer-step cap consume every useful positive chunk before zero-gradient
+    chunks without repeatedly training on any rollout sample.
+    """
+    if randomized_indices.ndim != 1:
+        raise ValueError(
+            "Randomized sample indices must be one-dimensional, got shape "
+            f"{tuple(randomized_indices.shape)}."
+        )
+    positive_samples = positive_advantage_sample_mask(advantages, loss_mask)
+    if randomized_indices.numel() != positive_samples.numel():
+        raise ValueError(
+            "Randomized sample index count must match flattened rollout samples: "
+            f"indices={randomized_indices.numel()}, "
+            f"samples={positive_samples.numel()}."
+        )
+    if randomized_indices.device != positive_samples.device:
+        positive_samples = positive_samples.to(randomized_indices.device)
+    randomized_positive = positive_samples[randomized_indices]
+    return torch.cat(
+        (
+            randomized_indices[randomized_positive],
+            randomized_indices[~randomized_positive],
+        )
+    )
+
+
+def should_stop_ppo_update(
+    mean_abs_approx_kl: float,
+    target_kl: Optional[float],
+) -> bool:
+    """Return whether a PPO update should stop at a KL safety boundary.
+
+    Args:
+        mean_abs_approx_kl: Mean absolute approximate KL for the latest global
+            batch, averaged across data-parallel ranks.
+        target_kl: Positive KL boundary, or ``None`` to disable the boundary.
+
+    Returns:
+        Whether the remaining PPO minibatches should be skipped.
+
+    Raises:
+        ValueError: If ``target_kl`` is not positive.
+    """
+    if target_kl is None:
+        return False
+    if target_kl <= 0:
+        raise ValueError(f"target_kl must be positive, got {target_kl}.")
+    return not math.isfinite(mean_abs_approx_kl) or mean_abs_approx_kl > target_kl
 
 
 def huber_loss(error: torch.Tensor, delta: float) -> torch.Tensor:
@@ -62,6 +180,92 @@ def kl_penalty(
         raise NotImplementedError
 
     raise NotImplementedError
+
+
+def compute_embodied_reference_kl(
+    logprobs: torch.Tensor,
+    ref_logprobs: torch.Tensor,
+    *,
+    kl_penalty_type: str,
+    logprob_type: str,
+    single_action_dim: int,
+    loss_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Aggregate an embodied-policy KL estimate using the PPO action layout.
+
+    Continuous embodied policies store one log-probability per scalar action
+    dimension.  PPO may optimize those probabilities at token, action, or
+    action-chunk granularity, so the reference-policy penalty must use the same
+    aggregation before masking and averaging.
+
+    ``logprobs`` is the live policy and ``ref_logprobs`` is the immutable
+    reference policy.  This order is important for the low-variance KL
+    estimator because rollout actions are sampled from the live/old policy.
+    """
+    if logprobs.shape != ref_logprobs.shape:
+        raise ValueError(
+            "Reference log-probability shape mismatch: "
+            f"live={tuple(logprobs.shape)}, ref={tuple(ref_logprobs.shape)}."
+        )
+    if logprobs.ndim < 2:
+        raise ValueError(
+            "Embodied log-probabilities must have a batch and action dimension, "
+            f"got shape {tuple(logprobs.shape)}."
+        )
+    if single_action_dim <= 0:
+        raise ValueError(
+            f"single_action_dim must be positive, got {single_action_dim}."
+        )
+
+    batch_size = logprobs.shape[0]
+    element_kl = kl_penalty(logprobs, ref_logprobs, kl_penalty_type)
+    if element_kl.numel() % (batch_size * single_action_dim) != 0:
+        raise ValueError(
+            "Embodied log-probabilities cannot be reshaped into scalar actions: "
+            f"shape={tuple(logprobs.shape)}, action_dim={single_action_dim}."
+        )
+    element_kl = element_kl.reshape(batch_size, -1, single_action_dim)
+
+    if logprob_type == "token_level":
+        aggregated_kl = element_kl
+    elif logprob_type == "action_level":
+        aggregated_kl = element_kl.sum(dim=-1)
+    elif logprob_type == "chunk_level":
+        aggregated_kl = element_kl.sum(dim=(1, 2))
+    else:
+        raise ValueError(
+            "Unsupported embodied reference-KL logprob_type "
+            f"{logprob_type!r}. Expected token_level, action_level, or chunk_level."
+        )
+
+    if loss_mask is None:
+        return aggregated_kl.mean()
+
+    mask = loss_mask.to(device=aggregated_kl.device, dtype=torch.bool)
+    if mask.numel() % batch_size != 0:
+        raise ValueError(
+            "Embodied loss mask cannot be aligned to the reference KL: "
+            f"mask_shape={tuple(mask.shape)}, batch_size={batch_size}."
+        )
+    mask = mask.reshape(batch_size, -1)
+
+    if logprob_type == "chunk_level":
+        mask = mask.any(dim=-1)
+    else:
+        action_steps = aggregated_kl.shape[1]
+        if mask.shape[1] == 1:
+            mask = mask.expand(batch_size, action_steps)
+        elif mask.shape[1] != action_steps:
+            raise ValueError(
+                "Embodied loss mask action length does not match the reference KL: "
+                f"mask={mask.shape[1]}, kl={action_steps}."
+            )
+        if logprob_type == "token_level":
+            mask = mask.unsqueeze(-1).expand_as(aggregated_kl)
+
+    if not mask.any():
+        return aggregated_kl.sum() * 0.0
+    return aggregated_kl.masked_select(mask).mean()
 
 
 def preprocess_embodied_advantages_inputs(

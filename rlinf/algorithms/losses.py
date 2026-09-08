@@ -368,13 +368,18 @@ def compute_ppo_critic_loss(
         masked_returns = returns
         masked_values = values
 
-    var_returns = torch.var(masked_returns)
-    if torch.isnan(var_returns) or var_returns == 0:
-        explained_variance = torch.tensor(float("nan"), device=returns.device)
+    # A masked micro-batch may contain only one valid transition.  The default
+    # Bessel correction makes ``torch.var`` return NaN in that case, and one
+    # such value poisons the metric averaged over the entire PPO update.  EV is
+    # undefined for constant targets, so use the conventional finite fallback
+    # of zero while leaving the critic loss and gradients unchanged.
+    var_returns = torch.var(masked_returns, correction=0)
+    if not torch.isfinite(var_returns) or var_returns <= 0:
+        explained_variance = values.new_zeros(())
     else:
-        var_diff = torch.var(masked_returns - masked_values)
-        if torch.isnan(var_diff):
-            explained_variance = torch.tensor(float("nan"), device=returns.device)
+        var_diff = torch.var(masked_returns - masked_values, correction=0)
+        if not torch.isfinite(var_diff):
+            explained_variance = values.new_zeros(())
         else:
             explained_variance = 1 - var_diff / var_returns
 

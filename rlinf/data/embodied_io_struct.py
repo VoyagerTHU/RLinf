@@ -615,12 +615,17 @@ class EmbodiedRolloutResult:
 
     def append_transitions(self, curr_obs=None, next_obs=None):
         assert curr_obs is not None and next_obs is not None
-        if "task_descriptions" in curr_obs:
-            curr_obs.pop("task_descriptions")
-        if "task_descriptions" in next_obs:
-            next_obs.pop("task_descriptions")
-        self.curr_obs.append(curr_obs)
-        self.next_obs.append(next_obs)
+        # Replay storage accepts tensor fields only. Do not pop the language
+        # field from the live environment observation: the same dictionary may
+        # already be queued for the next VLA inference call.
+        stored_curr_obs = {
+            key: value for key, value in curr_obs.items() if key != "task_descriptions"
+        }
+        stored_next_obs = {
+            key: value for key, value in next_obs.items() if key != "task_descriptions"
+        }
+        self.curr_obs.append(stored_curr_obs)
+        self.next_obs.append(stored_next_obs)
 
     def clear(self):
         self.actions.clear()

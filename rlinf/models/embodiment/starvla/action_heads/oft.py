@@ -101,8 +101,26 @@ def _run_oft_backbone_and_head(
             input_ids,
             action_token_id=getattr(model, "action_token_id", None),
         )
-        mean_actions = model.action_model.predict_action(action_queries)
+        action_model_dtype = next(
+            (
+                parameter.dtype
+                for parameter in model.action_model.parameters()
+                if parameter.is_floating_point()
+            ),
+            action_queries.dtype,
+        )
+        action_queries = action_queries.to(dtype=action_model_dtype)
+        # Call the module rather than its helper method so a separately wrapped
+        # FSDP action head executes its pre-forward all-gather hook. The native
+        # OFT head's forward delegates to predict_action, so unwrapped numerics
+        # remain identical.
+        mean_actions = model.action_model(action_queries)
 
+    # Some deployed policies predict a longer horizon than the environment
+    # executes before replanning. Keep all query tokens in the backbone, but
+    # compute sampling and PPO likelihoods only for actions that affect the
+    # environment.
+    mean_actions = mean_actions[:, : policy.num_executed_action_chunks]
     dist = Normal(mean_actions, torch.exp(policy.actor_logstd).view(1, 1, -1))
     return mean_actions, last_hidden, dist
 

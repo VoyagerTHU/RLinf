@@ -147,11 +147,19 @@ class FSDPStrategy(FSDPStrategyBase):
         param_dtype = torch_dtype_from_precision(mixed_precision_config.param_dtype)
         reduce_dtype = torch_dtype_from_precision(mixed_precision_config.reduce_dtype)
         buffer_dtype = torch_dtype_from_precision(mixed_precision_config.buffer_dtype)
-        mixed_precision = MixedPrecision(
-            param_dtype=param_dtype,
-            reduce_dtype=reduce_dtype,
-            buffer_dtype=buffer_dtype,
+        all_unset = param_dtype is None and reduce_dtype is None and buffer_dtype is None
+        all_fp32 = (
+            param_dtype == torch.float32
+            and reduce_dtype == torch.float32
+            and buffer_dtype == torch.float32
         )
+        mixed_precision = None
+        if not (all_unset or all_fp32):
+            mixed_precision = MixedPrecision(
+                param_dtype=param_dtype,
+                reduce_dtype=reduce_dtype,
+                buffer_dtype=buffer_dtype,
+            )
 
         sharding_strategy = get_sharding_strategy(
             self.cfg.fsdp_config.sharding_strategy

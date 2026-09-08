@@ -273,6 +273,8 @@ def prepare_actions(
             action_dim=action_dim,
             action_space=policy,
         )
+    elif env_type == SupportedEnvType.ROBOCASA_GR1:
+        chunk_actions = raw_chunk_actions
     elif env_type == SupportedEnvType.REALWORLD:
         chunk_actions = raw_chunk_actions
     elif env_type == SupportedEnvType.FRANKASIM:

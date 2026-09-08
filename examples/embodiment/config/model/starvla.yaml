@@ -7,14 +7,27 @@ model_path: "/path/to/model/starvla/checkpoints/step_xxx.pt"
 # Keep aligned with your StarVLA runtime (usually bf16 on A800/H100).
 precision: "bf16"
 
+# Optional precision override for only the action model. Set to fp32 when
+# fine-tuning a BF16 checkpoint with optimizer steps smaller than BF16's local
+# quantization interval; the VLM backbone remains at `precision` above.
+action_model_precision: null
+
 # Action/chunk settings used by RLinf wrapper.
 # IMPORTANT: must match the checkpoint's action horizon/chunk length.
 action_dim: 7
 num_action_chunks: 8
 
-# LoRA settings (disabled by default for StarVLA wrapper path)
+# LoRA settings. Set is_lora=true and lora_scope=qwen3_vl to freeze the
+# StarVLA action head and train adapters only inside the complete Qwen3-VL
+# subtree (vision and language). The default all-linear target is resolved
+# within that subtree, so similarly named OFT action-head layers are excluded.
+# Set lora_train_action_head=true to train the full action head alongside those
+# adapters while keeping the Qwen base weights and actor logstd frozen.
 is_lora: False
 lora_rank: 32
+lora_scope: qwen3_vl
+lora_target_modules: all-linear
+lora_train_action_head: False
 
 # Common embodied fields used by RLinf validation / env adapters.
 use_proprio: True
