@@ -34,8 +34,10 @@ runner:
     log_path: ${oc.env:ROBOCASA_GR1_GRPO_LOG_ROOT,/data/dengyixuan/wyz/experiments/rlinf_starvla_robocasa_gr1_grpo_groupfix_20260908}
     project_name: rlinf-starvla-robocasa-gr1
     experiment_name: cup_to_drawer_close_grpo_groupfix_tokenlevel_lr1e6
-    # Local backends only; W&B uploads need explicit authorization.
-    logger_backends: [tensorboard]
+    # No remote backend: W&B uploads need explicit authorization and the
+    # training venv has no tensorboard. Every step is still persisted to
+    # metrics/training_step_metrics.jsonl and rollout_tables/*.jsonl.
+    logger_backends: []
   max_epochs: 100
   max_steps: -1
   only_eval: false
