@@ -32,6 +32,10 @@ from rlinf.utils.placement import (
     ModelParallelComponentPlacement,
     PlacementMode,
 )
+from rlinf.utils.rollout_grouping import (
+    GROUP_RELATIVE_ADV_TYPES,
+    resolve_envs_per_actor_trajectory,
+)
 from rlinf.utils.rollout_horizon import resolve_action_steps_per_chunk
 
 if TYPE_CHECKING:
@@ -867,6 +871,23 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.train.total_num_envs // env_world_size // rollout.pipeline_stage_num must be divisible by the group size"
         )
+        # Group-relative advantages (and reward filtering) are computed inside
+        # each actor rank's local batch, so the env -> actor trajectory split
+        # must never place part of a seed group on a different actor rank.
+        if str(
+            cfg.algorithm.get("adv_type", "")
+        ).lower() in GROUP_RELATIVE_ADV_TYPES or cfg.algorithm.get(
+            "filter_rewards", False
+        ):
+            resolve_envs_per_actor_trajectory(
+                num_envs_per_env_stage=(
+                    cfg.env.train.total_num_envs // env_world_size // stage_num
+                ),
+                env_world_size=env_world_size,
+                pipeline_stage_num=stage_num,
+                actor_world_size=component_placement.get_world_size("actor"),
+                group_size=cfg.env.train.group_size,
+            )
         train_action_steps = resolve_action_steps_per_chunk(
             cfg.env.train, cfg.actor.model
         )

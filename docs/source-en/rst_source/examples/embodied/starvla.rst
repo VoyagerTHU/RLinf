@@ -272,13 +272,26 @@ adapters and the complete action head; Qwen base weights and a fixed
 action-head prefix together with the ``.lora_A.`` and ``.lora_B.`` name
 fragments so resumed rollout workers receive both trained components.
 
-The GR1 policy's joint action contains ``16 x 29 = 464`` Gaussian dimensions,
-so its PPO update is substantially more sensitive than the 8 x 7-D LIBERO
-recipe. The supplied config uses a ``1e-9`` actor learning rate, 512 chunk
-samples per global batch, at most five optimizer steps per rollout, and a
-``target_kl`` safety boundary. Metrics report the first, last, and maximum
-global-batch KL plus whether the boundary or optimizer-step limit stopped the
+The GR1 policy executes ``12 x 29 = 348`` Gaussian action dimensions per
+chunk with ``sigma = exp(-3.5)``, so a chunk-level likelihood ratio sums 348
+log-ratios and PPO clipping saturates after tiny mean shifts. The supplied
+config therefore optimizes ``token_level`` (per-dimension) ratios with a
+``0.2`` clip, a ``1e-6`` learning rate on the FP32 OFT head, 512 chunk samples
+per global batch, and a per-dimension ``target_kl`` trust region measured with
+the low-variance estimator. The reference-policy KL is a leash rather than a
+boundary: ``reference_target_kl`` adapts ``kl_beta`` after every update
+(doubling above ``1.5x`` target, halving below ``target / 1.5``, clamped to
+``[kl_beta_min, kl_beta_max]``). A hard stop against the immutable reference
+could never recover once exceeded. Metrics report the first, last, and maximum
+global-batch proximal and reference KL, the coefficient used and its next
+value, and whether the trust region or optimizer-step limit stopped the
 remaining minibatches.
+
+Grouped GRPO requires ``env`` and ``actor`` to have the same world size (or at
+least that every trajectory piece an actor rank receives holds whole seed
+groups): environment workers split their rollouts across actor ranks by batch
+position, and group-relative advantages are normalized inside each actor rank.
+``validate_embodied_cfg`` rejects placements that would cut a seed group.
 
 Use the controller script to alternate training and official-compatible fixed
 50-seed evaluation. It registers the original checkpoint as step 0, keeps

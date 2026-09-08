@@ -29,6 +29,7 @@ from torch.utils._pytree import tree_map
 import rlinf.algorithms  # noqa: F401
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
+    adapt_kl_beta,
     compute_embodied_reference_kl,
     kl_penalty,
     positive_advantage_sample_mask,
@@ -1009,6 +1010,37 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
         self.ref_policy_state_dict = None
         self.offload_model_buffer = None
+        # Reference-KL leash: ``reference_target_kl`` adapts ``kl_beta`` after
+        # every update (PPO-penalty style) instead of rejecting optimizer steps.
+        # A hard stop against an immutable reference can never recover once it
+        # is exceeded, because only optimizer steps can move the policy back.
+        self.reference_target_kl = self.cfg.algorithm.get("reference_target_kl", None)
+        self.kl_beta_min = float(self.cfg.algorithm.get("kl_beta_min", 1e-4))
+        self.kl_beta_max = float(self.cfg.algorithm.get("kl_beta_max", 1.0))
+        self.kl_beta_adapt_factor = float(
+            self.cfg.algorithm.get("kl_beta_adapt_factor", 2.0)
+        )
+        if self.reference_target_kl is not None:
+            self.reference_target_kl = float(self.reference_target_kl)
+            if self.reference_target_kl <= 0:
+                raise ValueError(
+                    "algorithm.reference_target_kl must be positive, got "
+                    f"{self.reference_target_kl}."
+                )
+            if self.kl_beta <= 0:
+                raise ValueError(
+                    "algorithm.reference_target_kl adapts algorithm.kl_beta and "
+                    "therefore requires a positive initial kl_beta."
+                )
+            # Validate the controller bounds once up front.
+            adapt_kl_beta(
+                self.kl_beta,
+                self.reference_target_kl,
+                self.reference_target_kl,
+                factor=self.kl_beta_adapt_factor,
+                min_beta=self.kl_beta_min,
+                max_beta=self.kl_beta_max,
+            )
 
         # Sync weight comm options
         max_ctas = cfg.rollout.get("sync_weight_nccl_max_ctas", None)
@@ -1070,9 +1102,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if model is None:
             model = super().model_provider_func()
 
-        trainable_prefixes = self.cfg.actor.get(
-            "trainable_parameter_prefixes", None
-        )
+        trainable_prefixes = self.cfg.actor.get("trainable_parameter_prefixes", None)
         if trainable_prefixes:
             if not self.cfg.actor.fsdp_config.get("use_orig_params", False):
                 raise ValueError(
@@ -1509,9 +1539,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "actor/rollout_actor_logprob_mean_abs_delta": (
                     delta.abs().mean().item()
                 ),
-                "actor/rollout_actor_logprob_max_abs_delta": (
-                    delta.abs().max().item()
-                ),
+                "actor/rollout_actor_logprob_max_abs_delta": (delta.abs().max().item()),
             }
         )
         self.model.train()
@@ -1527,9 +1555,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         observable and catches both ineffective sub-ULP updates and excessive
         policy movement.
         """
-        enabled = bool(
-            self.cfg.algorithm.get("audit_post_update_logprobs", False)
-        )
+        enabled = bool(self.cfg.algorithm.get("audit_post_update_logprobs", False))
         metrics = {
             "actor/post_update_logprob_audit": float(enabled),
             "actor/post_update_logprob_audit_seconds": 0.0,
@@ -1621,9 +1647,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
             reference = replay_batch.get("ref_logprobs", None)
             if reference is not None:
-                reference_delta = (
-                    current - reference.to(current).float()
-                ).reshape(current.shape[0], -1)
+                reference_delta = (current - reference.to(current).float()).reshape(
+                    current.shape[0], -1
+                )
                 if loss_mask is not None:
                     reference_delta = reference_delta[flat_mask]
                 else:
@@ -1650,15 +1676,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "actor/post_update_logprob_audit_seconds": (
                     time.perf_counter() - start_time
                 ),
-                "actor/post_update_logprob_finite_fraction": (
-                    sums[1].item() / total
-                ),
+                "actor/post_update_logprob_finite_fraction": (sums[1].item() / total),
                 "actor/post_update_ratio_finite_fraction": (
                     sums[5].item() / finite_count
                 ),
-                "actor/post_update_logprob_mean_delta": (
-                    sums[2].item() / finite_count
-                ),
+                "actor/post_update_logprob_mean_delta": (sums[2].item() / finite_count),
                 "actor/post_update_logprob_mean_abs_delta": (
                     sums[3].item() / finite_count
                 ),
@@ -1670,9 +1692,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "actor/post_update_reference_logprob_mean_abs_delta": (
                     sums[6].item() / reference_count
                 ),
-                "actor/post_update_reference_logprob_max_abs_delta": (
-                    maxima[2].item()
-                ),
+                "actor/post_update_reference_logprob_max_abs_delta": (maxima[2].item()),
             }
         )
         self.model.train()
@@ -1791,10 +1811,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 self.rollout_batch.get("loss_mask", None),
             )
 
-        positive_chunk_samples_available = positive_advantage_sample_mask(
-            self.rollout_batch["advantages"],
-            self.rollout_batch.get("loss_mask", None),
-        ).sum().item()
+        positive_chunk_samples_available = (
+            positive_advantage_sample_mask(
+                self.rollout_batch["advantages"],
+                self.rollout_batch.get("loss_mask", None),
+            )
+            .sum()
+            .item()
+        )
 
         with torch.no_grad():
             self.rollout_batch = process_nested_dict_for_train(
@@ -1830,10 +1854,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             target_kl = float(target_kl)
             # Validate before any optimizer work is performed.
             should_stop_ppo_update(0.0, target_kl)
-        reference_target_kl = self.cfg.algorithm.get("reference_target_kl", None)
-        if reference_target_kl is not None:
-            reference_target_kl = float(reference_target_kl)
-            should_stop_ppo_update(0.0, reference_target_kl)
+        reference_target_kl = self.reference_target_kl
         max_optimizer_steps_per_update = self.cfg.algorithm.get(
             "max_optimizer_steps_per_update", None
         )
@@ -1853,6 +1874,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         first_global_batch_reference_kl = None
         last_global_batch_reference_kl = 0.0
         max_global_batch_reference_kl = 0.0
+        global_batch_reference_kl_values: list[float] = []
+        # Proximal (old-policy vs. current) KL uses the non-negative low-variance
+        # estimator aggregated exactly like the loss; the signed k1 mean stored
+        # in ``actor/approx_kl`` can stay near zero while the policy moves.
+        first_global_batch_proximal_kl = None
+        last_global_batch_proximal_kl = 0.0
+        max_global_batch_proximal_kl = 0.0
         positive_chunk_samples_this_update = 0
         for _ in range(update_epoch):
             rollout_dataloader_iter = split_dict_to_chunk(
@@ -1890,6 +1918,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 )
                 global_batch_abs_kl_sum = torch.zeros_like(global_batch_kl_sum)
                 global_batch_reference_kl_sum = torch.zeros_like(global_batch_kl_sum)
+                global_batch_proximal_kl_sum = torch.zeros_like(global_batch_kl_sum)
                 for idx, batch in enumerate(train_micro_batch):
                     batch = put_tensor_device(
                         batch,
@@ -1989,6 +2018,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     metrics_data["actor/reference_kl_loss"] = (
                         reference_kl_loss.detach().item()
                     )
+                    with torch.no_grad():
+                        proximal_kl = compute_embodied_reference_kl(
+                            output_dict["logprobs"].detach(),
+                            prev_logprobs.reshape_as(output_dict["logprobs"]).to(
+                                output_dict["logprobs"]
+                            ),
+                            kl_penalty_type="low_var_kl",
+                            logprob_type=self.cfg.algorithm.logprob_type,
+                            single_action_dim=self.cfg.actor.model.get("action_dim", 7),
+                            loss_mask=loss_mask,
+                        )
+                    metrics_data["actor/proximal_low_var_kl"] = proximal_kl.item()
+                    global_batch_proximal_kl_sum += proximal_kl
                     micro_batch_kl = torch.as_tensor(
                         metrics_data["actor/approx_kl"],
                         device=global_batch_kl_sum.device,
@@ -2037,6 +2079,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 global_batch_reference_kl = (
                     global_batch_reference_kl_sum / num_micro_batches
                 )
+                global_batch_proximal_kl = (
+                    global_batch_proximal_kl_sum / num_micro_batches
+                )
                 torch.distributed.all_reduce(
                     global_batch_kl, op=torch.distributed.ReduceOp.AVG
                 )
@@ -2046,17 +2091,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 torch.distributed.all_reduce(
                     global_batch_reference_kl, op=torch.distributed.ReduceOp.AVG
                 )
+                torch.distributed.all_reduce(
+                    global_batch_proximal_kl, op=torch.distributed.ReduceOp.AVG
+                )
                 global_batch_kl_value = global_batch_kl.item()
                 global_batch_abs_kl_value = global_batch_abs_kl.item()
                 global_batch_reference_kl_value = global_batch_reference_kl.item()
+                global_batch_proximal_kl_value = global_batch_proximal_kl.item()
                 if first_global_batch_kl is None:
                     first_global_batch_kl = global_batch_kl_value
                 if first_global_batch_reference_kl is None:
-                    first_global_batch_reference_kl = (
-                        global_batch_reference_kl_value
-                    )
+                    first_global_batch_reference_kl = global_batch_reference_kl_value
+                if first_global_batch_proximal_kl is None:
+                    first_global_batch_proximal_kl = global_batch_proximal_kl_value
                 last_global_batch_kl = global_batch_kl_value
                 last_global_batch_reference_kl = global_batch_reference_kl_value
+                last_global_batch_proximal_kl = global_batch_proximal_kl_value
                 max_global_batch_abs_kl = max(
                     max_global_batch_abs_kl, global_batch_abs_kl_value
                 )
@@ -2064,24 +2114,28 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     max_global_batch_reference_kl,
                     global_batch_reference_kl_value,
                 )
+                max_global_batch_proximal_kl = max(
+                    max_global_batch_proximal_kl, global_batch_proximal_kl_value
+                )
+                global_batch_reference_kl_values.append(global_batch_reference_kl_value)
 
-                exceeded_proximal_kl = should_stop_ppo_update(
-                    global_batch_abs_kl_value, target_kl
-                )
-                exceeded_reference_kl = should_stop_ppo_update(
-                    global_batch_reference_kl_value, reference_target_kl
-                )
-                if exceeded_proximal_kl or exceeded_reference_kl:
+                # Only the proximal trust region stops an update. The reference
+                # KL is enforced through the adaptive penalty coefficient below;
+                # a hard reference stop could never be recovered from.
+                if should_stop_ppo_update(global_batch_proximal_kl_value, target_kl):
                     early_stopped_on_kl = True
                     self.optimizer.zero_grad()
                     self._logger.warning(
                         "Skipping the pending optimizer step and stopping remaining PPO "
-                        "minibatches because a KL boundary was exceeded: proximal "
-                        "abs KL=%.6f (target=%s), reference KL=%.6f (target=%s).",
-                        global_batch_abs_kl_value,
+                        "minibatches because the proximal KL boundary was exceeded: "
+                        "low-var KL=%.6f (target=%s), signed k1=%.6f, reference "
+                        "KL=%.6f (target=%s, kl_beta=%.3g).",
+                        global_batch_proximal_kl_value,
                         target_kl,
+                        global_batch_kl_value,
                         global_batch_reference_kl_value,
                         reference_target_kl,
+                        self.kl_beta,
                     )
                     break
 
@@ -2099,8 +2153,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 append_to_dict(metrics, data)
                 if (
                     max_optimizer_steps_per_update is not None
-                    and optimizer_steps_this_update
-                    >= max_optimizer_steps_per_update
+                    and optimizer_steps_this_update >= max_optimizer_steps_per_update
                 ):
                     stopped_on_optimizer_step_limit = True
                     self._logger.info(
@@ -2111,13 +2164,50 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     break
             if early_stopped_on_kl or stopped_on_optimizer_step_limit:
                 break
+
+        kl_beta_before_update = self.kl_beta
+        mean_global_batch_reference_kl = (
+            float(np.mean(global_batch_reference_kl_values))
+            if global_batch_reference_kl_values
+            else 0.0
+        )
+        if reference_target_kl is not None and global_batch_reference_kl_values:
+            # The reference KL values were all-reduced, so every rank derives
+            # the same coefficient without additional communication.
+            self.kl_beta = adapt_kl_beta(
+                self.kl_beta,
+                mean_global_batch_reference_kl,
+                reference_target_kl,
+                factor=self.kl_beta_adapt_factor,
+                min_beta=self.kl_beta_min,
+                max_beta=self.kl_beta_max,
+            )
+            if self.kl_beta != kl_beta_before_update:
+                self._logger.info(
+                    "Adapted reference-KL coefficient: kl_beta %.3g -> %.3g "
+                    "(mean reference KL %.6f, target %.6f).",
+                    kl_beta_before_update,
+                    self.kl_beta,
+                    mean_global_batch_reference_kl,
+                    reference_target_kl,
+                )
         append_to_dict(
             metrics,
             {
-                "actor/first_global_batch_kl": (
-                    first_global_batch_kl
-                    if first_global_batch_kl is not None
+                "actor/kl_beta": kl_beta_before_update,
+                "actor/kl_beta_next": self.kl_beta,
+                "actor/mean_global_batch_reference_kl": (
+                    mean_global_batch_reference_kl
+                ),
+                "actor/first_global_batch_proximal_kl": (
+                    first_global_batch_proximal_kl
+                    if first_global_batch_proximal_kl is not None
                     else 0.0
+                ),
+                "actor/last_global_batch_proximal_kl": last_global_batch_proximal_kl,
+                "actor/max_global_batch_proximal_kl": max_global_batch_proximal_kl,
+                "actor/first_global_batch_kl": (
+                    first_global_batch_kl if first_global_batch_kl is not None else 0.0
                 ),
                 "actor/last_global_batch_kl": last_global_batch_kl,
                 "actor/max_global_batch_abs_kl": max_global_batch_abs_kl,
@@ -2129,9 +2219,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "actor/last_global_batch_reference_kl": (
                     last_global_batch_reference_kl
                 ),
-                "actor/max_global_batch_reference_kl": (
-                    max_global_batch_reference_kl
-                ),
+                "actor/max_global_batch_reference_kl": (max_global_batch_reference_kl),
                 "actor/optimizer_steps_this_update": optimizer_steps_this_update,
                 "actor/optimizer_chunk_samples_this_update": (
                     optimizer_steps_this_update * self.cfg.actor.global_batch_size
@@ -2146,9 +2234,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     prioritize_positive_samples
                 ),
                 "actor/optimizer_mean_passes_over_rollout": (
-                    optimizer_steps_this_update
-                    * batch_size_per_rank
-                    / rollout_size
+                    optimizer_steps_this_update * batch_size_per_rank / rollout_size
                 ),
                 "actor/early_stopped_on_kl": float(early_stopped_on_kl),
                 "actor/stopped_on_optimizer_step_limit": float(
@@ -2176,6 +2262,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             f"proximal_first={mean_metric_dict['actor/first_global_batch_kl']:.9g}, "
             f"proximal_last={mean_metric_dict['actor/last_global_batch_kl']:.9g}, "
             f"proximal_max_abs={mean_metric_dict['actor/max_global_batch_abs_kl']:.9g}, "
+            "proximal_lowvar_first="
+            f"{mean_metric_dict['actor/first_global_batch_proximal_kl']:.9g}, "
+            "proximal_lowvar_last="
+            f"{mean_metric_dict['actor/last_global_batch_proximal_kl']:.9g}, "
+            "proximal_lowvar_max="
+            f"{mean_metric_dict['actor/max_global_batch_proximal_kl']:.9g}, "
+            f"kl_beta={mean_metric_dict['actor/kl_beta']:.9g}->"
+            f"{mean_metric_dict['actor/kl_beta_next']:.9g}, "
+            "reference_mean="
+            f"{mean_metric_dict['actor/mean_global_batch_reference_kl']:.9g}, "
             "reference_first="
             f"{mean_metric_dict['actor/first_global_batch_reference_kl']:.9g}, "
             "reference_last="

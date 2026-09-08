@@ -366,6 +366,11 @@ class MultiStepRolloutWorker(Worker):
             if mode == "train"
             else self._eval_sampling_params
         )
+        # StarVLA defaults to training mode and samples Gaussian actions there.
+        # Forward the requested phase explicitly so evaluation executes the
+        # deterministic action mean, matching the standalone fixed-seed evaluator.
+        if SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.STARVLA:
+            kwargs = {**kwargs, "mode": mode}
 
         if SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.OPENPI,

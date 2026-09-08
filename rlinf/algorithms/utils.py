@@ -135,6 +135,62 @@ def should_stop_ppo_update(
     return not math.isfinite(mean_abs_approx_kl) or mean_abs_approx_kl > target_kl
 
 
+def adapt_kl_beta(
+    kl_beta: float,
+    measured_kl: float,
+    target_kl: float,
+    *,
+    factor: float = 2.0,
+    min_beta: float = 1e-4,
+    max_beta: float = 1.0,
+    tolerance: float = 1.5,
+) -> float:
+    """Return the next reference-KL penalty coefficient (PPO-penalty style).
+
+    The reference-policy KL is a *leash*, not a hard boundary: skipping
+    optimizer steps whenever the live policy is already farther than
+    ``target_kl`` from the immutable reference can never bring it back, so an
+    exceeded hard stop silently freezes training forever.  Instead, the
+    coefficient of the KL penalty is scaled up when the measured KL is well
+    above the target and scaled down when it is well below, as in the adaptive
+    variant of PPO (Schulman et al., 2017, Section 4).
+
+    Args:
+        kl_beta: Current penalty coefficient.
+        measured_kl: Reference KL measured over the update that just finished.
+        target_kl: Desired reference KL.
+        factor: Multiplicative adjustment applied per update.
+        min_beta: Lower clamp so the penalty (and its measurement) never vanish.
+        max_beta: Upper clamp.
+        tolerance: Dead band; ``measured_kl`` within ``[target/tolerance,
+            target*tolerance]`` leaves ``kl_beta`` unchanged.
+
+    Returns:
+        The adjusted coefficient.
+
+    Raises:
+        ValueError: If any bound or factor is not positive/consistent.
+    """
+    if target_kl <= 0:
+        raise ValueError(f"target_kl must be positive, got {target_kl}.")
+    if factor <= 1.0:
+        raise ValueError(f"factor must be greater than 1, got {factor}.")
+    if tolerance < 1.0:
+        raise ValueError(f"tolerance must be at least 1, got {tolerance}.")
+    if not 0 < min_beta <= max_beta:
+        raise ValueError(
+            f"Require 0 < min_beta <= max_beta, got min={min_beta}, max={max_beta}."
+        )
+    if not math.isfinite(measured_kl):
+        # A non-finite estimate is treated as "too far": tighten the leash.
+        return min(kl_beta * factor, max_beta)
+    if measured_kl > target_kl * tolerance:
+        return min(kl_beta * factor, max_beta)
+    if measured_kl < target_kl / tolerance:
+        return max(kl_beta / factor, min_beta)
+    return float(min(max(kl_beta, min_beta), max_beta))
+
+
 def huber_loss(error: torch.Tensor, delta: float) -> torch.Tensor:
     return torch.where(
         error.abs() < delta, 0.5 * error**2, delta * (error.abs() - 0.5 * delta)

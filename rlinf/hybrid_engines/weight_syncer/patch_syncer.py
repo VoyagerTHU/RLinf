@@ -700,7 +700,9 @@ class PatchWeightSyncer(WeightSyncer):
                 raise TypeError(
                     "Patch init sync receiver does not support DTensor state_dict values"
                 )
-            target.copy_(value, non_blocking=True)
+            # A CPU target is consumed outside the CUDA stream that enqueued
+            # the copy; returning early could expose a partially written tensor.
+            target.copy_(value, non_blocking=target.device.type != "cpu")
 
     async def _apply_init_weights(
         self,

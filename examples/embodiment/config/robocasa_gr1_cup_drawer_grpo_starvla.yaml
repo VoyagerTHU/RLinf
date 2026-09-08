@@ -17,27 +17,31 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    # Actor and rollout remain eight-way. Four EnvWorkers host eight grouped
-    # trajectories each; communication mapping splits each group across the
-    # rollout ranks while keeping the simulator count at 32.
-    actor,rollout: ${oc.env:ROBOCASA_GR1_ACTOR_ROLLOUT_PLACEMENT,0-7}
-    env: ${oc.env:ROBOCASA_GR1_ENV_PLACEMENT,0-3}
+    # env and actor MUST have the same world size for grouped GRPO: environment
+    # workers split their trajectories across actor ranks purely by batch
+    # position, and group-relative advantages are normalized inside each actor
+    # rank's local batch. With env=4 / actor=8 every 8-trajectory seed group
+    # was cut in half and two different seeds were normalized against each
+    # other. `validate_embodied_cfg` now rejects such placements. Four
+    # EnvWorkers x 8 simulators = 32 envs = one seed group per worker.
+    actor,rollout: ${oc.env:ROBOCASA_GR1_ACTOR_ROLLOUT_PLACEMENT,4-7}
+    env: ${oc.env:ROBOCASA_GR1_ENV_PLACEMENT,4-7}
 
 runner:
   task_type: embodied
   weight_sync_interval: 1
   logger:
-    log_path: ${oc.env:ROBOCASA_GR1_GRPO_LOG_ROOT,/data/dengyixuan/wyz/experiments/rlinf_starvla_robocasa_gr1_grpo}
+    log_path: ${oc.env:ROBOCASA_GR1_GRPO_LOG_ROOT,/data/dengyixuan/wyz/experiments/rlinf_starvla_robocasa_gr1_grpo_groupfix_20260908}
     project_name: rlinf-starvla-robocasa-gr1
-    experiment_name: cup_to_drawer_close_grpo_official_aligned_lowvar_mb256
-    logger_backends: [wandb]
+    experiment_name: cup_to_drawer_close_grpo_groupfix_tokenlevel_lr1e6
+    # Local backends only; W&B uploads need explicit authorization.
+    logger_backends: [tensorboard]
   max_epochs: 100
   max_steps: -1
   only_eval: false
-  # GPU EGL contexts are intentionally not pre-created for validation while
-  # training. Run the fixed 50-seed evaluation separately from checkpoints.
-  val_check_interval: -1
-  # The outer train/eval controller evaluates every saved 5-step checkpoint.
+  # In-loop validation runs the fixed 50-seed suite on the Mesa renderer every
+  # five steps (56 simulator slots, six padded and excluded from metrics).
+  val_check_interval: 5
   save_interval: 5
   resume_dir: null
   ckpt_path: null
@@ -53,8 +57,8 @@ algorithm:
   # order inside positive and zero-gradient partitions. This makes a capped
   # number of optimizer steps consume useful chunks before inactive ones.
   prioritize_positive_advantage_samples: false
-  # Use the non-negative low-variance estimator for the now-functional
-  # immutable StarVLA reference-policy penalty.
+  # Non-negative low-variance estimator for both the immutable StarVLA
+  # reference-policy penalty and the proximal (old-vs-new policy) trust region.
   kl_penalty: low_var_kl
   group_size: 8
   reward_coef: 1.0
@@ -62,36 +66,56 @@ algorithm:
   rollout_epoch: 4
   eval_rollout_epoch: 1
   reward_type: chunk_level
-  logprob_type: chunk_level
+  # Per-scalar-action likelihood ratios. The executed chunk has 12 x 29 = 348
+  # Gaussian dimensions with sigma = exp(-3.5) ~ 0.03; a chunk-level ratio sums
+  # all 348 log-ratios, so a mean shift of 1% of the action range already gives
+  # a chunk KL of ~77 and PPO clipping zeroes the gradient of most samples
+  # (clip fraction 0.4-0.6 in earlier runs). Token-level ratios keep clipping
+  # and the KL boundaries on a per-dimension scale, matching RLinf's
+  # OpenVLA-OFT recipes.
+  logprob_type: token_level
   entropy_type: token_level
   update_epoch: 1
   adv_type: grpo
   loss_type: actor
   loss_agg_func: token-mean
+  # Initial reference-KL coefficient; adapted each update toward
+  # `reference_target_kl` (see below) within [kl_beta_min, kl_beta_max].
   kl_beta: 0.001
-  reference_forward_micro_batch_size: 1
+  kl_beta_min: 1.0e-4
+  kl_beta_max: 1.0
+  kl_beta_adapt_factor: 2.0
+  reference_forward_micro_batch_size: 4
   entropy_bonus: 0.0
-  clip_ratio_high: 0.1
-  clip_ratio_low: 0.1
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
   clip_ratio_c: 3.0
-  # Reject a pending update before it moves the joint 12 x 29-D executed-action
-  # Gaussian too far from the rollout policy.
+  # Proximal trust region (per-dimension low-variance KL between the rollout
+  # policy and the pending update, averaged over the global batch). Remaining
+  # minibatches are skipped once it is exceeded. This is the only hard stop.
   target_kl: 0.02
-  # Unlike target_kl, this is measured against the immutable pretrained
-  # StarVLA checkpoint across training steps. The pending optimizer step is
-  # skipped once the summed 12 x 29-D low-variance KL estimate crosses it.
-  reference_target_kl: 0.02
-  # A second guard for small-KL but overly repeated updates on one rollout.
-  max_optimizer_steps_per_update: 5
+  # Reference leash measured against the immutable pretrained StarVLA
+  # checkpoint (same per-dimension estimator). It no longer rejects optimizer
+  # steps: a hard stop against a fixed reference can never recover once
+  # exceeded. Instead kl_beta doubles when the mean reference KL of an update
+  # exceeds 1.5x this target and halves when it drops below target/1.5.
+  # 0.05 per dimension corresponds to a mean shift of ~0.3 sigma (~0.5% of the
+  # normalized action range).
+  reference_target_kl: 0.05
+  # One full pass over the 7680 chunk samples is 15 optimizer steps at
+  # global_batch_size 512; target_kl decides how many actually run.
+  max_optimizer_steps_per_update: null
   # Re-evaluate sampled actions on the FSDP actor so PPO old/new ratios do not
   # amplify rollout-vs-actor numerical differences at small exploration std.
+  # The recompute, reference, training and audit passes all use the same
+  # micro-batch size, so they see bit-identical batch compositions.
   recompute_rollout_logprobs_on_actor: true
-  actor_logprob_recompute_micro_batch_size: 1
+  actor_logprob_recompute_micro_batch_size: 4
   # Replay the sampled actions once after the optimizer update. This makes a
   # one-step update's realized movement observable instead of reporting only
   # the necessarily-zero pre-update KL.
   audit_post_update_logprobs: true
-  post_update_logprob_audit_micro_batch_size: 1
+  post_update_logprob_audit_micro_batch_size: 4
   value_clip: 0.2
   huber_delta: 10.0
   gamma: 0.99
@@ -154,9 +178,10 @@ env:
         - episode.sample_trajectory
       video_base_dir: ${runner.logger.log_path}/video/train
   eval:
-    # Communication batches must divide evenly across eight rollout workers.
-    # Six padded environments duplicate seeds but metric_valid excludes them,
-    # so every reported validation rate is exactly the fixed 50-seed suite.
+    # Communication batches must divide evenly across the four env/rollout
+    # workers. Six padded environments duplicate seeds but metric_valid
+    # excludes them, so every reported validation rate is exactly the fixed
+    # 50-seed suite.
     total_num_envs: 56
     group_size: 1
     is_eval: true
@@ -191,9 +216,9 @@ rollout:
   unnorm_key: ${actor.model.unnorm_key}
   enable_offload: false
   pipeline_stage_num: 1
-  # Batch-one inference matches StarVLA's policy server numerics while the
-  # simulator processes still advance concurrently.
-  inference_micro_batch_size: 1
+  # One forward per rollout rank (8 envs). Batch-level numerical differences
+  # against the actor are absorbed by recompute_rollout_logprobs_on_actor.
+  inference_micro_batch_size: 8
   model:
     model_path: ${actor.model.model_path}
     precision: ${actor.model.precision}
@@ -216,9 +241,8 @@ actor:
   training_backend: fsdp
   # Fine-tune only the OFT head; the BF16 VLM backbone remains frozen.
   trainable_parameter_prefixes: [starvla_model.action_model]
-  micro_batch_size: 1
-  # Each optimizer step averages 512 chunk samples; the explicit step limit
-  # consumes at most five of the 15 available global minibatches.
+  micro_batch_size: 4
+  # Each optimizer step averages 512 chunk samples (15 steps per full pass).
   global_batch_size: 512
   seed: 42
   enable_offload: false
@@ -245,7 +269,8 @@ actor:
     action_stats_source: minmax
     add_value_head: false
     # Reduced exploration preserves more pretrained-policy successes while
-    # still producing mixed-outcome GRPO groups. Keep it fixed across updates.
+    # still producing mixed-outcome GRPO groups (~80% of seed groups were mixed
+    # at -3.5 versus 6% sampled success at -2.5). Keep it fixed across updates.
     initial_logstd: -3.5
     trainable_logstd: false
     use_proprio: false
@@ -257,9 +282,12 @@ actor:
       expected_image_size: [224, 224]
       enable_state_input: false
   optim:
-    # The FP32 head makes every Adam update effective; 1e-9 keeps a calibrated
-    # single-step log-ratio within roughly 1.5e-3 before closed-loop training.
-    lr: 1.0e-9
+    # FP32 head. With Adam the per-step parameter movement is ~lr regardless
+    # of gradient scale; 1e-6 moves the per-dimension log-probability by
+    # ~4e-3 per optimizer step in earlier calibrations, i.e. a per-dimension
+    # KL of ~2e-3 over a full 15-step pass, comfortably inside target_kl.
+    # (1e-9 left most FP32 weights unchanged: it is below their ULP.)
+    lr: 1.0e-6
     value_lr: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
@@ -276,8 +304,8 @@ actor:
     gradient_checkpointing: false
     # Preserve the checkpoint's native per-module dtypes. FSDP's BF16 forward
     # hook changes OFT action-head numerics relative to the unwrapped rollout
-    # policy; with no hook, eight-way FULL_SHARD reproduces rollout logprobs
-    # exactly on identical replay inputs.
+    # policy; with no hook, FULL_SHARD reproduces rollout logprobs exactly on
+    # identical replay inputs.
     mixed_precision:
       param_dtype: null
       reduce_dtype: null
