@@ -1,0 +1,1346 @@
+From 0a53e04409e500eea245aca0c9c4295d17a9476a Mon Sep 17 00:00:00 2001
+From: VoyagerTHU <voyager.work@icloud.com>
+Date: Wed, 9 Sep 2026 16:21:30 +0000
+Subject: [PATCH] feat(robocasa-gr1): fixed-seed evaluation tooling and
+ policy-server fixes
+
+Local changes used by the RLinf RoboCasa GR1 GRPO/PPO/SAC recipes:
+deterministic fixed-seed evaluation scripts, file-based policy server,
+robocasa interface / simulation env / video wrapper fixes, and a logger
+call fix in the framework auto-import.
+
+Signed-off-by: VoyagerTHU <voyager.work@icloud.com>
+---
+ deployment/model_server/server_policy.py      |  26 ++-
+ .../model_server/tools/file_policy_server.py  |  44 +++++
+ .../tools/websocket_policy_client.py          |  36 +++-
+ .../eval_files/merge_fixed_seed_shards.py     | 136 ++++++++++++++
+ .../eval_files/model2robocasa_interface.py    |  46 +++--
+ .../eval_files/seed_manifest.py               | 146 +++++++++++++++
+ .../eval_files/simulation_env.py              | 170 ++++++++++++++++-
+ .../summarize_fixed_seed_results.py           |  63 +++++++
+ .../eval_files/verify_rollout_videos.py       |  67 +++++++
+ .../eval_files/verify_seed_determinism.py     |  60 ++++++
+ .../wrappers/video_recording_wrapper.py       |  38 ++--
+ .../Robocasa_tabletop/run_fixed_seed_eval.sh  | 176 ++++++++++++++++++
+ starVLA/model/framework/__init__.py           |   2 +-
+ 13 files changed, 969 insertions(+), 41 deletions(-)
+ create mode 100644 deployment/model_server/tools/file_policy_server.py
+ create mode 100644 examples/Robocasa_tabletop/eval_files/merge_fixed_seed_shards.py
+ create mode 100755 examples/Robocasa_tabletop/eval_files/seed_manifest.py
+ create mode 100755 examples/Robocasa_tabletop/eval_files/summarize_fixed_seed_results.py
+ create mode 100644 examples/Robocasa_tabletop/eval_files/verify_rollout_videos.py
+ create mode 100644 examples/Robocasa_tabletop/eval_files/verify_seed_determinism.py
+ create mode 100755 examples/Robocasa_tabletop/run_fixed_seed_eval.sh
+
+diff --git a/deployment/model_server/server_policy.py b/deployment/model_server/server_policy.py
+index 4596e37..c628560 100644
+--- a/deployment/model_server/server_policy.py
++++ b/deployment/model_server/server_policy.py
+@@ -6,6 +6,7 @@ import logging
+ import socket
+ import argparse
+ from deployment.model_server.tools.websocket_policy_server import WebsocketPolicyServer
++from deployment.model_server.tools.file_policy_server import FilePolicyServer
+ from starVLA.model.framework.base_framework import baseframework
+ import torch, os
+ 
+@@ -28,14 +29,20 @@ def main(args) -> None:
+     local_ip = socket.gethostbyname(hostname)
+     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
+ 
+-    # start websocket server
+-    server = WebsocketPolicyServer(
+-        policy=vla,
+-        host="0.0.0.0",
+-        port=args.port,
+-        idle_timeout=args.idle_timeout,
+-        metadata={"env": "simpler_env"},
+-    )
++    if args.file_bridge_dir:
++        server = FilePolicyServer(
++            policy=vla,
++            bridge_dir=args.file_bridge_dir,
++            metadata={"env": "robocasa", "transport": "file"},
++        )
++    else:
++        server = WebsocketPolicyServer(
++            policy=vla,
++            host="0.0.0.0",
++            port=args.port,
++            idle_timeout=args.idle_timeout,
++            metadata={"env": "simpler_env"},
++        )
+     logging.info("server running ...")
+     server.serve_forever()
+ 
+@@ -46,6 +53,7 @@ def build_argparser():
+     parser.add_argument("--port", type=int, default=10093)
+     parser.add_argument("--use_bf16", action="store_true")
+     parser.add_argument("--idle_timeout" , type=int, default=1800, help="Idle timeout in seconds, -1 means never close")
++    parser.add_argument("--file_bridge_dir", type=str, default=None)
+     return parser
+ 
+ 
+@@ -67,4 +75,4 @@ if __name__ == "__main__":
+     if os.getenv("DEBUG", False):
+         print("🔍 DEBUGPY is enabled")
+         start_debugpy_once()
+-    main(args)
+\ No newline at end of file
++    main(args)
+diff --git a/deployment/model_server/tools/file_policy_server.py b/deployment/model_server/tools/file_policy_server.py
+new file mode 100644
+index 0000000..1703489
+--- /dev/null
++++ b/deployment/model_server/tools/file_policy_server.py
+@@ -0,0 +1,44 @@
++"""Filesystem transport for policy inference when local sockets are unavailable."""
++
++from __future__ import annotations
++
++import os
++import time
++from pathlib import Path
++
++from . import msgpack_numpy
++from .websocket_policy_server import WebsocketPolicyServer
++
++
++class FilePolicyServer:
++    """Serve the same policy protocol through atomic files in a shared directory."""
++
++    def __init__(self, policy, bridge_dir: str | Path, metadata: dict | None = None):
++        self.bridge_dir = Path(bridge_dir)
++        self.bridge_dir.mkdir(parents=True, exist_ok=True)
++        self._router = WebsocketPolicyServer(policy=policy, metadata=metadata)
++        self._packer = msgpack_numpy.Packer()
++        self._write_atomic("metadata.msgpack", self._packer.pack(metadata or {}))
++
++    def _write_atomic(self, name: str, payload: bytes) -> None:
++        destination = self.bridge_dir / name
++        temporary = destination.with_suffix(destination.suffix + f".tmp.{os.getpid()}")
++        temporary.write_bytes(payload)
++        os.replace(temporary, destination)
++
++    def serve_forever(self) -> None:
++        while True:
++            requests = sorted(self.bridge_dir.glob("request.*.msgpack"))
++            if not requests:
++                time.sleep(0.002)
++                continue
++            for request_path in requests:
++                request_id = request_path.name.removeprefix("request.").removesuffix(".msgpack")
++                try:
++                    message = msgpack_numpy.unpackb(request_path.read_bytes())
++                    response = self._router._route_message(message)
++                finally:
++                    request_path.unlink(missing_ok=True)
++                self._write_atomic(
++                    f"response.{request_id}.msgpack", self._packer.pack(response)
++                )
+diff --git a/deployment/model_server/tools/websocket_policy_client.py b/deployment/model_server/tools/websocket_policy_client.py
+index 4b1291a..79e8527 100644
+--- a/deployment/model_server/tools/websocket_policy_client.py
++++ b/deployment/model_server/tools/websocket_policy_client.py
+@@ -4,6 +4,8 @@
+ 
+ import logging, argparse
+ import time, os
++from pathlib import Path
++import uuid
+ from typing import Dict, Optional, Tuple
+ 
+ from typing_extensions import override
+@@ -19,6 +21,22 @@ class WebsocketClientPolicy:
+     """
+ 
+     def __init__(self, host: str = "127.0.0.1", port: Optional[int] = 10093, api_key: Optional[str] = None) -> None:
++        file_bridge_dir = os.environ.get("STARVLA_FILE_BRIDGE_DIR")
++        if file_bridge_dir:
++            self._bridge_dir = Path(file_bridge_dir)
++            self._bridge_dir.mkdir(parents=True, exist_ok=True)
++            self._packer = msgpack_numpy.Packer()
++            self._api_key = api_key
++            metadata_path = self._bridge_dir / "metadata.msgpack"
++            deadline = time.time() + 300
++            while not metadata_path.exists():
++                if time.time() >= deadline:
++                    raise TimeoutError(f"File policy server not ready in {self._bridge_dir}")
++                time.sleep(0.1)
++            self._server_metadata = msgpack_numpy.unpackb(metadata_path.read_bytes())
++            self._ws = None
++            return
++        self._bridge_dir = None
+         # 0.0.0.0 cannot be used as a connection target, here default 127.0.0.1
+         self._uri = f"ws://{host}"
+         if port is not None:
+@@ -59,6 +77,8 @@ class WebsocketClientPolicy:
+                 time.sleep(2)
+ 
+     def close(self) -> None:
++        if self._bridge_dir is not None:
++            return
+         try:
+             self._ws.close()
+         except Exception:
+@@ -66,6 +86,21 @@ class WebsocketClientPolicy:
+     
+     @override
+     def predict_action(self, query_info: Dict) -> Dict:
++        if self._bridge_dir is not None:
++            request_id = f"{os.getpid()}-{uuid.uuid4().hex}"
++            request_path = self._bridge_dir / f"request.{request_id}.msgpack"
++            response_path = self._bridge_dir / f"response.{request_id}.msgpack"
++            temporary_path = request_path.with_suffix(request_path.suffix + ".tmp")
++            temporary_path.write_bytes(self._packer.pack(query_info))
++            os.replace(temporary_path, request_path)
++            deadline = time.time() + 300
++            while not response_path.exists():
++                if time.time() >= deadline:
++                    raise TimeoutError(f"Policy response timed out: {request_id}")
++                time.sleep(0.002)
++            response = msgpack_numpy.unpackb(response_path.read_bytes())
++            response_path.unlink()
++            return response
+         data = self._packer.pack(query_info)
+         self._ws.send(data)
+         response = self._ws.recv()
+@@ -74,4 +109,3 @@ class WebsocketClientPolicy:
+         return msgpack_numpy.unpackb(response)
+ 
+ 
+-
+diff --git a/examples/Robocasa_tabletop/eval_files/merge_fixed_seed_shards.py b/examples/Robocasa_tabletop/eval_files/merge_fixed_seed_shards.py
+new file mode 100644
+index 0000000..2baa829
+--- /dev/null
++++ b/examples/Robocasa_tabletop/eval_files/merge_fixed_seed_shards.py
+@@ -0,0 +1,136 @@
++"""Merge two fixed-seed result shards and audit their rollout videos."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++from pathlib import Path
++
++from examples.Robocasa_tabletop.eval_files.seed_manifest import load_manifest
++
++
++def read_result(path: Path) -> dict:
++    with path.open(encoding="utf-8") as file:
++        return json.load(file)
++
++
++def write_atomic(path: Path, payload: dict) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temporary = path.with_suffix(path.suffix + ".tmp")
++    with temporary.open("w", encoding="utf-8") as file:
++        json.dump(payload, file, indent=2)
++        file.write("\n")
++    os.replace(temporary, path)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--run-root", type=Path, required=True)
++    parser.add_argument("--seed-manifest", type=Path, required=True)
++    parser.add_argument("--split", type=int, default=25)
++    parser.add_argument("--output-results-subdir", default="results_merged")
++    args = parser.parse_args()
++
++    manifest = load_manifest(args.seed_manifest)
++    total_episodes = manifest["episodes_per_task"]
++    if not 0 < args.split < total_episodes:
++        raise ValueError("split must be strictly inside the manifest episode range")
++
++    report = {
++        "tasks": {},
++        "complete_videos": 0,
++        "unfinalized_completed_videos": 0,
++        "video_result_success_mismatches": 0,
++        "partial_videos": 0,
++    }
++    matched_video_paths: set[Path] = set()
++    for task_name in manifest["task_order"]:
++        task_slug = task_name.split("/", 1)[1]
++        first = read_result(args.run_root / "results" / f"{task_slug}.json")
++        second = read_result(args.run_root / "results_shard25" / f"{task_slug}.json")
++        first_records = first["episodes"]
++        second_records = second["episodes"]
++        expected_seeds = manifest["tasks"][task_name]
++        actual_seeds = [record["seed"] for record in first_records + second_records]
++        if len(first_records) != args.split or len(second_records) != total_episodes - args.split:
++            raise ValueError(f"Incomplete result shards for {task_name}")
++        if actual_seeds != expected_seeds:
++            raise ValueError(f"Seed order mismatch for {task_name}")
++        expected_indices = list(range(total_episodes))
++        actual_indices = [record["episode_index"] for record in first_records + second_records]
++        if actual_indices != expected_indices:
++            raise ValueError(f"Episode index mismatch for {task_name}: {actual_indices}")
++
++        merged_records = first_records + second_records
++        successes = sum(bool(record["success"]) for record in merged_records)
++        merged = {
++            "env_name": task_name,
++            "n_episodes": total_episodes,
++            "completed_episodes": total_episodes,
++            "successes": successes,
++            "success_rate": successes / total_episodes,
++            "episodes": merged_records,
++        }
++        write_atomic(
++            args.run_root / args.output_results_subdir / f"{task_slug}.json", merged
++        )
++
++        task_video_count = 0
++        task_unfinalized_completed_videos = 0
++        task_video_result_mismatches = 0
++        for record in merged_records:
++            episode_index = record["episode_index"]
++            video_root = "videos" if episode_index < args.split else "videos_shard25"
++            video_prefix = (
++                args.run_root
++                / video_root
++                / task_slug
++                / f"episode_{episode_index:03d}_seed_{record['seed']}"
++            )
++            candidates = [
++                Path(str(video_prefix) + "_success0.mp4"),
++                Path(str(video_prefix) + "_success1.mp4"),
++                Path(str(video_prefix) + ".mp4"),
++            ]
++            completed = [path for path in candidates if path.is_file() and path.stat().st_size > 0]
++            if len(completed) != 1:
++                raise FileNotFoundError(
++                    f"Expected exactly one completed rollout video for {video_prefix}, got {completed}"
++                )
++            video_success = completed[0].name.endswith("_success1.mp4")
++            matched_video_paths.add(completed[0])
++            is_unfinalized = completed[0].name == video_prefix.name + ".mp4"
++            if is_unfinalized:
++                task_unfinalized_completed_videos += 1
++            elif video_success != bool(record["success"]):
++                task_video_result_mismatches += 1
++            task_video_count += 1
++        report["complete_videos"] += task_video_count
++        report["unfinalized_completed_videos"] += task_unfinalized_completed_videos
++        report["video_result_success_mismatches"] += task_video_result_mismatches
++        report["tasks"][task_name] = {
++            "episodes": total_episodes,
++            "successes": successes,
++            "complete_videos": task_video_count,
++            "unfinalized_completed_videos": task_unfinalized_completed_videos,
++            "video_result_success_mismatches": task_video_result_mismatches,
++        }
++
++    partials = []
++    for video_root in ("videos", "videos_shard25"):
++        for path in (args.run_root / video_root).glob("**/*.mp4"):
++            if (
++                "_success0.mp4" not in path.name
++                and "_success1.mp4" not in path.name
++                and path not in matched_video_paths
++            ):
++                partials.append(str(path))
++    report["partial_videos"] = len(partials)
++    report["partial_video_paths"] = partials
++    write_atomic(args.run_root / "merge_audit.json", report)
++    print(json.dumps({k: v for k, v in report.items() if k != "tasks"}, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/Robocasa_tabletop/eval_files/model2robocasa_interface.py b/examples/Robocasa_tabletop/eval_files/model2robocasa_interface.py
+index 2d396e4..dc3a450 100644
+--- a/examples/Robocasa_tabletop/eval_files/model2robocasa_interface.py
++++ b/examples/Robocasa_tabletop/eval_files/model2robocasa_interface.py
+@@ -11,10 +11,29 @@ from examples.Robocasa_tabletop.eval_files.adaptive_ensemble import AdaptiveEnse
+ from typing import Dict
+ import numpy as np
+ from pathlib import Path
+-
+-
+-
+-from starVLA.model.framework.share_tools import read_mode_config
++import json
++import yaml
++
++
++
++def read_mode_config(pretrained_checkpoint):
++    """Read checkpoint-side config and normalization stats without importing torch."""
++    checkpoint_path = Path(pretrained_checkpoint)
++    if not checkpoint_path.is_file() or checkpoint_path.suffix != ".pt":
++        raise FileNotFoundError(f"Invalid StarVLA checkpoint: {checkpoint_path}")
++    run_dir = checkpoint_path.parents[1]
++    config_path = run_dir / "config.yaml"
++    statistics_path = run_dir / "dataset_statistics.json"
++    if not config_path.exists() or not statistics_path.exists():
++        raise FileNotFoundError(
++            f"Checkpoint metadata missing beside {checkpoint_path}: "
++            f"config={config_path.exists()}, statistics={statistics_path.exists()}"
++        )
++    with config_path.open(encoding="utf-8") as file:
++        model_config = yaml.safe_load(file)
++    with statistics_path.open(encoding="utf-8") as file:
++        norm_stats = json.load(file)
++    return model_config, norm_stats
+ 
+ 
+ 
+@@ -145,10 +164,17 @@ class PolicyWarper:
+         
+         
+         # unnormalize the action
+-        normalized_actions = response["data"]["normalized_actions"] # B, chunk, D        
+-        
+-        # unnormalize actions in batch form
+-        raw_actions = self.unnormalize_actions(normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats)
++        response_data = response["data"]
++        if "env_actions" in response_data:
++            # RLinf's BasePolicy contract returns actions already mapped into the
++            # environment action space. The official StarVLA server instead
++            # returns normalized_actions, which are handled by the legacy path.
++            raw_actions = np.asarray(response_data["env_actions"], dtype=np.float32)
++        else:
++            normalized_actions = response_data["normalized_actions"] # B, chunk, D
++
++            # unnormalize actions in batch form
++            raw_actions = self.unnormalize_actions(normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats)
+         
+         # raw_actions shape: (B, chunk, D)
+         if self.action_ensemble:
+@@ -240,7 +266,7 @@ class PolicyWarper:
+         axs["image"].set_xlabel("Time in one episode (subsampled)")
+         plt.legend()
+         plt.savefig(save_path)
+-    
++
+     @staticmethod
+     def _check_unnorm_key(norm_stats, unnorm_key):
+         """
+@@ -270,5 +296,3 @@ class PolicyWarper:
+             cos_state = np.cos(state[key])
+             state[key] = np.concatenate([sin_state, cos_state], axis=-1)
+         return state
+-    
+-    
+\ No newline at end of file
+diff --git a/examples/Robocasa_tabletop/eval_files/seed_manifest.py b/examples/Robocasa_tabletop/eval_files/seed_manifest.py
+new file mode 100755
+index 0000000..2af967d
+--- /dev/null
++++ b/examples/Robocasa_tabletop/eval_files/seed_manifest.py
+@@ -0,0 +1,146 @@
++"""Generate and validate deterministic RoboCasa-GR1 evaluation seed manifests."""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import random
++from pathlib import Path
++from typing import Any
++
++
++TASK_NAMES = (
++    "gr1_unified/PnPCupToDrawerClose_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PnPPotatoToMicrowaveClose_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PnPMilkToMicrowaveClose_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PnPBottleToCabinetClose_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PnPWineToCabinetClose_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PnPCanToDrawerClose_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromCuttingboardToBasketSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromCuttingboardToCardboardboxSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromCuttingboardToPanSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromCuttingboardToPotSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromCuttingboardToTieredbasketSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromPlacematToBasketSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromPlacematToBowlSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromPlacematToPlateSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromPlacematToTieredshelfSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromPlateToBowlSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromPlateToCardboardboxSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromPlateToPanSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromPlateToPlateSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromTrayToCardboardboxSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromTrayToPlateSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromTrayToPotSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromTrayToTieredbasketSplitA_GR1ArmsAndWaistFourierHands_Env",
++    "gr1_unified/PosttrainPnPNovelFromTrayToTieredshelfSplitA_GR1ArmsAndWaistFourierHands_Env",
++)
++
++
++def _task_rng(base_seed: int, task_name: str) -> random.Random:
++    digest = hashlib.sha256(f"{base_seed}:{task_name}".encode()).digest()
++    return random.Random(int.from_bytes(digest[:8], byteorder="big", signed=False))
++
++
++def generate_manifest(base_seed: int = 20260819, episodes_per_task: int = 50) -> dict[str, Any]:
++    """Return a stable manifest with distinct seeds for every task episode."""
++    if episodes_per_task <= 0:
++        raise ValueError("episodes_per_task must be positive")
++    seed_population = range(1, 2**31 - 1)
++    tasks = {
++        task_name: _task_rng(base_seed, task_name).sample(seed_population, episodes_per_task)
++        for task_name in TASK_NAMES
++    }
++    manifest = {
++        "schema_version": 1,
++        "base_seed": base_seed,
++        "episodes_per_task": episodes_per_task,
++        "generator": "sha256(base_seed:task_name) -> Python random.sample(range(1, 2**31-1))",
++        "task_order": list(TASK_NAMES),
++        "tasks": tasks,
++    }
++    validate_manifest(manifest, expected_episodes=episodes_per_task)
++    return manifest
++
++
++def validate_manifest(manifest: dict[str, Any], expected_episodes: int | None = None) -> None:
++    """Raise ValueError when a seed manifest cannot drive a fair 24-task evaluation."""
++    if manifest.get("schema_version") != 1:
++        raise ValueError(f"Unsupported seed manifest schema: {manifest.get('schema_version')!r}")
++    task_order = manifest.get("task_order")
++    tasks = manifest.get("tasks")
++    if task_order != list(TASK_NAMES):
++        raise ValueError("Seed manifest task_order does not match the canonical 24-task order")
++    if not isinstance(tasks, dict) or set(tasks) != set(TASK_NAMES):
++        raise ValueError("Seed manifest must contain exactly the canonical 24 tasks")
++    episode_count = expected_episodes or manifest.get("episodes_per_task")
++    if not isinstance(episode_count, int) or episode_count <= 0:
++        raise ValueError("Invalid episodes_per_task in seed manifest")
++    for task_name in TASK_NAMES:
++        seeds = tasks[task_name]
++        if len(seeds) != episode_count:
++            raise ValueError(f"{task_name} has {len(seeds)} seeds, expected {episode_count}")
++        if len(set(seeds)) != len(seeds):
++            raise ValueError(f"{task_name} contains duplicate episode seeds")
++        if not all(isinstance(seed, int) and 0 < seed < 2**31 - 1 for seed in seeds):
++            raise ValueError(f"{task_name} contains an invalid seed")
++
++
++def load_manifest(path: str | Path, expected_episodes: int | None = None) -> dict[str, Any]:
++    with Path(path).open(encoding="utf-8") as file:
++        manifest = json.load(file)
++    validate_manifest(manifest, expected_episodes=expected_episodes)
++    return manifest
++
++
++def save_manifest(manifest: dict[str, Any], path: str | Path) -> Path:
++    output_path = Path(path)
++    output_path.parent.mkdir(parents=True, exist_ok=True)
++    with output_path.open("w", encoding="utf-8") as file:
++        json.dump(manifest, file, indent=2)
++        file.write("\n")
++    return output_path
++
++
++def take_first(manifest: dict[str, Any], count: int) -> dict[str, Any]:
++    """Return a validated prefix manifest, useful for exact-seed smoke tests."""
++    validate_manifest(manifest)
++    if not 0 < count <= manifest["episodes_per_task"]:
++        raise ValueError(f"count must be in [1, {manifest['episodes_per_task']}]")
++    subset = dict(manifest)
++    subset["episodes_per_task"] = count
++    subset["tasks"] = {task: list(manifest["tasks"][task][:count]) for task in TASK_NAMES}
++    subset["source_episodes_per_task"] = manifest["episodes_per_task"]
++    validate_manifest(subset, expected_episodes=count)
++    return subset
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--output", type=Path)
++    parser.add_argument("--input", type=Path)
++    parser.add_argument("--base-seed", type=int, default=20260819)
++    parser.add_argument("--episodes-per-task", type=int, default=50)
++    parser.add_argument("--take-first", type=int)
++    parser.add_argument("--list-tasks", action="store_true")
++    args = parser.parse_args()
++    if args.list_tasks:
++        print("\n".join(TASK_NAMES))
++        return
++    if args.output is None:
++        parser.error("--output is required unless --list-tasks is used")
++    if args.input is not None:
++        manifest = load_manifest(args.input)
++        if args.take_first is not None:
++            manifest = take_first(manifest, args.take_first)
++    else:
++        if args.take_first is not None:
++            parser.error("--take-first requires --input")
++        manifest = generate_manifest(args.base_seed, args.episodes_per_task)
++    output = save_manifest(manifest, args.output)
++    print(output)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/Robocasa_tabletop/eval_files/simulation_env.py b/examples/Robocasa_tabletop/eval_files/simulation_env.py
+index d94d71c..e80a420 100644
+--- a/examples/Robocasa_tabletop/eval_files/simulation_env.py
++++ b/examples/Robocasa_tabletop/eval_files/simulation_env.py
+@@ -25,6 +25,7 @@ import dataclasses
+ import json
+ import logging
+ import os
++import hashlib
+ 
+ # Required for robocasa environments
+ import robocasa  # noqa: F401
+@@ -41,6 +42,37 @@ from examples.Robocasa_tabletop.eval_files.wrappers.video_recording_wrapper impo
+ from examples.Robocasa_tabletop.eval_files.model2robocasa_interface import PolicyWarper
+ 
+ 
++def hash_observation(observation: Any) -> str:
++    """Return a stable hash for cross-framework initial-state verification."""
++    digest = hashlib.sha256()
++
++    def update(value: Any) -> None:
++        if isinstance(value, dict):
++            digest.update(b"dict")
++            for key in sorted(value):
++                digest.update(str(key).encode("utf-8"))
++                update(value[key])
++        elif isinstance(value, (list, tuple)):
++            digest.update(f"sequence:{len(value)}".encode("ascii"))
++            for item in value:
++                update(item)
++        elif isinstance(value, str):
++            digest.update(b"str:")
++            digest.update(value.encode("utf-8"))
++        else:
++            array = np.asarray(value)
++            digest.update(str(array.dtype).encode("ascii"))
++            digest.update(str(array.shape).encode("ascii"))
++            if array.dtype.hasobject:
++                for item in array.reshape(-1):
++                    update(item)
++            else:
++                digest.update(np.ascontiguousarray(array).tobytes())
++
++    update(observation)
++    return digest.hexdigest()
++
++
+ @dataclass
+ class VideoConfig:
+     """Configuration for video recording settings."""
+@@ -74,6 +106,11 @@ class SimulationConfig:
+     n_envs: int = 1
+     video: VideoConfig = field(default_factory=VideoConfig)
+     multistep: MultiStepConfig = field(default_factory=MultiStepConfig)
++    episode_seeds: Optional[List[int]] = None
++    result_path: Optional[str] = None
++    resume: bool = True
++    video_episode_start: int = 0
++    episode_index_offset: int = 0
+ 
+ 
+ class SimulationInferenceEnv:
+@@ -125,7 +162,35 @@ class SimulationInferenceEnv:
+         
+         if self.model is None:
+             raise ValueError("No model provided. Please provide a model either in __init__ or run_simulation")
++        if config.episode_seeds is not None:
++            if config.n_envs != 1:
++                raise ValueError("Explicit per-episode seeds currently require n_envs=1")
++            if len(config.episode_seeds) != config.n_episodes:
++                raise ValueError(
++                    f"Expected {config.n_episodes} episode seeds, got {len(config.episode_seeds)}"
++                )
++            if len(set(config.episode_seeds)) != len(config.episode_seeds):
++                raise ValueError("Episode seed list contains duplicates")
+         
++        episode_records = []
++        episode_successes = []
++        episode_lengths = []
++        if config.episode_seeds is not None and config.resume and config.result_path is not None:
++            result_path = Path(config.result_path)
++            if result_path.exists():
++                with result_path.open(encoding="utf-8") as file:
++                    previous_result = json.load(file)
++                if previous_result.get("env_name") != config.env_name:
++                    raise ValueError(f"Cannot resume {config.env_name} from {result_path}")
++                episode_records = previous_result.get("episodes", [])
++                previous_seeds = [record.get("seed") for record in episode_records]
++                if previous_seeds != config.episode_seeds[: len(previous_seeds)]:
++                    raise ValueError(f"Existing result seeds are not a manifest prefix: {result_path}")
++                episode_successes = [bool(record["success"]) for record in episode_records]
++                episode_lengths = [int(record["length"]) for record in episode_records]
++                config.video_episode_start = config.episode_index_offset + len(episode_records)
++                print(f"Resuming {config.env_name} from episode {config.video_episode_start}")
++
+         start_time = time.time()
+         print(
+             f"Running {config.n_episodes} episodes for {config.env_name} with {config.n_envs} environments"
+@@ -133,16 +198,50 @@ class SimulationInferenceEnv:
+         # Set up the environment
+         self.env = self.setup_environment(config)
+         # Initialize tracking variables
+-        episode_lengths = []
+         current_rewards = [0] * config.n_envs
+         current_lengths = [0] * config.n_envs
+         completed_episodes = 0
+         current_successes = [False] * config.n_envs
+-        episode_successes = []
+-        # Initial environment reset
+-        obs, _ = self.env.reset()
++        if config.episode_seeds is not None:
++            for episode_index in range(len(episode_records), len(config.episode_seeds)):
++                episode_seed = config.episode_seeds[episode_index]
++                global_episode_index = config.episode_index_offset + episode_index
++                obs, _ = self.env.reset(seed=episode_seed)
++                initial_observation_sha256 = hash_observation(obs)
++                episode_success = False
++                episode_reward = 0.0
++                episode_length = 0
++                while True:
++                    actions = self._get_actions_from_model(obs)
++                    obs, rewards, terminations, truncations, env_infos = self.env.step(actions)
++                    episode_success |= bool(np.asarray(env_infos["success"][0]).any())
++                    episode_reward += float(rewards[0])
++                    episode_length += 1
++                    if bool(terminations[0]) or bool(truncations[0]):
++                        break
++                episode_successes.append(episode_success)
++                episode_lengths.append(episode_length)
++                episode_records.append(
++                    {
++                        "episode_index": global_episode_index,
++                        "seed": episode_seed,
++                        "success": episode_success,
++                        "length": episode_length,
++                        "reward": episode_reward,
++                        "initial_observation_sha256": initial_observation_sha256,
++                    }
++                )
++                print(
++                    f"episode={global_episode_index:03d} seed={episode_seed} "
++                    f"success={int(episode_success)} length={episode_length}"
++                )
++                self._write_seeded_result(config, episode_records)
++            completed_episodes = len(episode_successes)
++        else:
++            # Preserve the upstream auto-reset behavior for callers without a manifest.
++            obs, _ = self.env.reset()
+         # Main simulation loop
+-        while completed_episodes < config.n_episodes:
++        while config.episode_seeds is None and completed_episodes < config.n_episodes:
+             # Process observations and get actions from the model
+             actions = self._get_actions_from_model(obs)
+             # Step the environment
+@@ -163,7 +262,6 @@ class SimulationInferenceEnv:
+                     current_lengths[env_idx] = 0
+             obs = next_obs
+         # Clean up
+-        self.env.reset()
+         self.env.close()
+         self.env = None
+         print(
+@@ -172,8 +270,32 @@ class SimulationInferenceEnv:
+         assert (
+             len(episode_successes) >= config.n_episodes
+         ), f"Expected at least {config.n_episodes} episodes, got {len(episode_successes)}"
++        episode_successes = episode_successes[: config.n_episodes]
++        if config.episode_seeds is not None:
++            self._write_seeded_result(config, episode_records)
+         return config.env_name, episode_successes
+ 
++    @staticmethod
++    def _write_seeded_result(config: SimulationConfig, episode_records: List[Dict[str, Any]]) -> None:
++        if config.result_path is None:
++            return
++        result_path = Path(config.result_path)
++        result_path.parent.mkdir(parents=True, exist_ok=True)
++        successes = [bool(record["success"]) for record in episode_records]
++        result_payload = {
++            "env_name": config.env_name,
++            "n_episodes": config.n_episodes,
++            "completed_episodes": len(episode_records),
++            "successes": int(sum(successes)),
++            "success_rate": float(np.mean(successes)) if successes else 0.0,
++            "episodes": episode_records,
++        }
++        temporary_path = result_path.with_suffix(result_path.suffix + ".tmp")
++        with temporary_path.open("w", encoding="utf-8") as file:
++            json.dump(result_payload, file, indent=2)
++            file.write("\n")
++        os.replace(temporary_path, result_path)
++
+     def _get_actions_from_model(self, observations: Dict[str, Any]) -> Dict[str, Any]:
+         """Process observations and get actions from the model."""
+         # Get actions from the model
+@@ -206,6 +328,7 @@ def _create_single_env(config: SimulationConfig, idx: int) -> gym.Env:
+             video_recorder,
+             video_dir=Path(config.video.video_dir),
+             steps_per_render=config.video.steps_per_render,
++            episode_index_start=config.video_episode_start,
+         )
+     # Add multi-step wrapper
+     env = MultiStepWrapper(
+@@ -226,6 +349,10 @@ def run_evaluation(
+     n_envs: int = 1,
+     n_action_steps: int = 2,
+     max_episode_steps: int = 100,
++    episode_seeds: Optional[List[int]] = None,
++    result_path: Optional[str] = None,
++    resume: bool = True,
++    episode_index_offset: int = 0,
+ ) -> Tuple[str, List[bool]]:
+     """
+     Simple entry point to run a simulation evaluation.
+@@ -249,6 +376,11 @@ def run_evaluation(
+         multistep=MultiStepConfig(
+             n_action_steps=n_action_steps, max_episode_steps=max_episode_steps
+         ),
++        episode_seeds=episode_seeds,
++        result_path=result_path,
++        resume=resume,
++        video_episode_start=episode_index_offset,
++        episode_index_offset=episode_index_offset,
+     )
+     # Create client and run simulation
+     client = SimulationInferenceEnv(model=model)
+@@ -277,9 +409,13 @@ class Args:
+     #################################################################################################################
+     # Utils
+     #################################################################################################################
+-    video_out_path: str = "experiments/1029_qwenGR00T_fourier_gr1_unified_1000_PnPMilkToMicrowaveClose_gpus_woPretrain_wState/checkpoints/steps_20000_pytorch_model.pt.log/gr1_unified/logs/PnPMilkToMicrowaveClose_GR1ArmsAndWaistFourierHands_Env"  # Path to save videos
++    video_out_path: Optional[str] = None  # Path to save videos; None disables recording
+ 
+     seed: int = 7  # Random Seed (for reproducibility)
++    seed_manifest_path: Optional[str] = None
++    seed_offset: int = 0
++    result_out_path: Optional[str] = None
++    resume: bool = True
+ 
+     pretrained_path: str = "results/Checkpoints/1029_qwenGR00T_fourier_gr1_unified_1000_PnPMilkToMicrowaveClose_gpus_woPretrain_wState/checkpoints/steps_20000_pytorch_model.pt"
+ 
+@@ -297,6 +433,20 @@ def eval_gr1_unified(args: Args) -> None:
+         image_size=args.resize_size,
+         n_action_steps=args.n_action_steps,
+     )
++    episode_seeds = None
++    if args.seed_manifest_path is not None:
++        from examples.Robocasa_tabletop.eval_files.seed_manifest import load_manifest
++
++        manifest = load_manifest(args.seed_manifest_path)
++        task_seeds = manifest["tasks"].get(args.env_name)
++        if task_seeds is None:
++            raise KeyError(f"Environment {args.env_name!r} is missing from seed manifest")
++        end = args.seed_offset + args.n_episodes
++        if args.seed_offset < 0 or end > len(task_seeds):
++            raise ValueError(
++                f"Seed slice [{args.seed_offset}:{end}] exceeds {len(task_seeds)} manifest seeds"
++            )
++        episode_seeds = task_seeds[args.seed_offset:end]
+     run_evaluation(
+         env_name=args.env_name,
+         model=model,
+@@ -305,6 +455,10 @@ def eval_gr1_unified(args: Args) -> None:
+         n_envs=args.n_envs,
+         n_action_steps=args.n_action_steps,
+         max_episode_steps=args.max_episode_steps,
++        episode_seeds=episode_seeds,
++        result_path=args.result_out_path,
++        resume=args.resume,
++        episode_index_offset=args.seed_offset,
+     )
+ 
+ def start_debugpy_once():
+@@ -317,4 +471,4 @@ def start_debugpy_once():
+     start_debugpy_once._started = True
+ 
+ if __name__ == "__main__":
+-    tyro.cli(eval_gr1_unified)
+\ No newline at end of file
++    tyro.cli(eval_gr1_unified)
+diff --git a/examples/Robocasa_tabletop/eval_files/summarize_fixed_seed_results.py b/examples/Robocasa_tabletop/eval_files/summarize_fixed_seed_results.py
+new file mode 100755
+index 0000000..dc37d22
+--- /dev/null
++++ b/examples/Robocasa_tabletop/eval_files/summarize_fixed_seed_results.py
+@@ -0,0 +1,63 @@
++"""Validate and summarize a complete fixed-seed RoboCasa-GR1 evaluation."""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++from pathlib import Path
++
++import numpy as np
++
++from examples.Robocasa_tabletop.eval_files.seed_manifest import TASK_NAMES, load_manifest
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--results-dir", type=Path, required=True)
++    parser.add_argument("--seed-manifest", type=Path, required=True)
++    parser.add_argument("--output", type=Path, required=True)
++    args = parser.parse_args()
++    manifest = load_manifest(args.seed_manifest)
++    task_results = {}
++    all_successes = []
++    for task_name in TASK_NAMES:
++        task_slug = task_name.split("/", 1)[1]
++        result_path = args.results_dir / f"{task_slug}.json"
++        with result_path.open(encoding="utf-8") as file:
++            result = json.load(file)
++        expected_seeds = manifest["tasks"][task_name]
++        actual_seeds = [episode["seed"] for episode in result["episodes"]]
++        if actual_seeds != expected_seeds:
++            raise ValueError(f"Seed mismatch for {task_name}")
++        successes = [bool(episode["success"]) for episode in result["episodes"]]
++        if len(successes) != manifest["episodes_per_task"]:
++            raise ValueError(f"Episode count mismatch for {task_name}")
++        observation_hashes = [episode.get("initial_observation_sha256") for episode in result["episodes"]]
++        if not all(isinstance(value, str) and len(value) == 64 for value in observation_hashes):
++            raise ValueError(f"Missing initial observation hash for {task_name}")
++        task_results[task_name] = {
++            "successes": int(sum(successes)),
++            "episodes": len(successes),
++            "success_rate": float(np.mean(successes)),
++            "unique_initial_observations": len(set(observation_hashes)),
++        }
++        all_successes.extend(successes)
++    summary = {
++        "seed_manifest_sha256": hashlib.sha256(args.seed_manifest.read_bytes()).hexdigest(),
++        "num_tasks": len(TASK_NAMES),
++        "episodes_per_task": manifest["episodes_per_task"],
++        "total_episodes": len(all_successes),
++        "macro_success_rate": float(np.mean([item["success_rate"] for item in task_results.values()])),
++        "total_success_rate": float(np.mean(all_successes)),
++        "tasks": task_results,
++    }
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    with args.output.open("w", encoding="utf-8") as file:
++        json.dump(summary, file, indent=2)
++        file.write("\n")
++    print(json.dumps(summary, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/Robocasa_tabletop/eval_files/verify_rollout_videos.py b/examples/Robocasa_tabletop/eval_files/verify_rollout_videos.py
+new file mode 100644
+index 0000000..e6ce9a8
+--- /dev/null
++++ b/examples/Robocasa_tabletop/eval_files/verify_rollout_videos.py
+@@ -0,0 +1,67 @@
++"""Fully decode fixed-seed rollout videos and report corrupt files."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import multiprocessing
++import os
++from pathlib import Path
++
++import av
++
++
++def decode_video(path_string: str) -> tuple[str, int, str | None]:
++    path = Path(path_string)
++    try:
++        with av.open(path) as container:
++            frame_count = sum(1 for _ in container.decode(video=0))
++        if frame_count <= 0:
++            raise ValueError("video contains no decoded frames")
++        return path_string, frame_count, None
++    except Exception as error:  # noqa: BLE001 - audit must record every decoder failure
++        return path_string, 0, repr(error)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--run-root", type=Path, required=True)
++    parser.add_argument("--workers", type=int, default=24)
++    parser.add_argument("--output", type=Path, required=True)
++    args = parser.parse_args()
++
++    paths = sorted(
++        str(path)
++        for root in (args.run_root / "videos", args.run_root / "videos_shard25")
++        for path in root.glob("**/*.mp4")
++    )
++    with multiprocessing.Pool(args.workers) as pool:
++        decoded = pool.map(decode_video, paths)
++    failures = [
++        {"path": path, "error": error}
++        for path, _, error in decoded
++        if error is not None
++    ]
++    frame_counts = [count for _, count, error in decoded if error is None]
++    report = {
++        "video_count": len(paths),
++        "decoded_video_count": len(frame_counts),
++        "failure_count": len(failures),
++        "min_frames": min(frame_counts) if frame_counts else 0,
++        "max_frames": max(frame_counts) if frame_counts else 0,
++        "total_frames": sum(frame_counts),
++        "failures": failures,
++    }
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    temporary = args.output.with_suffix(args.output.suffix + ".tmp")
++    with temporary.open("w", encoding="utf-8") as file:
++        json.dump(report, file, indent=2)
++        file.write("\n")
++    os.replace(temporary, args.output)
++    print(json.dumps(report, indent=2))
++    if failures:
++        raise RuntimeError(f"{len(failures)} rollout videos failed full decoding")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/Robocasa_tabletop/eval_files/verify_seed_determinism.py b/examples/Robocasa_tabletop/eval_files/verify_seed_determinism.py
+new file mode 100644
+index 0000000..0c01903
+--- /dev/null
++++ b/examples/Robocasa_tabletop/eval_files/verify_seed_determinism.py
+@@ -0,0 +1,60 @@
++"""Smoke-test that RoboCasa-GR1 resets are deterministic and seed-sensitive."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++from pathlib import Path
++
++import gymnasium as gym
++
++import robocasa  # noqa: F401
++from robocasa.utils.gym_utils import GrootRoboCasaEnv  # noqa: F401
++
++from examples.Robocasa_tabletop.eval_files.seed_manifest import TASK_NAMES
++from examples.Robocasa_tabletop.eval_files.simulation_env import hash_observation
++
++
++def reset_hash(env_name: str, seed: int) -> str:
++    env = gym.make(env_name, enable_render=True)
++    try:
++        observation, _ = env.reset(seed=seed)
++        return hash_observation(observation)
++    finally:
++        env.close()
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--env-name", default=TASK_NAMES[0])
++    parser.add_argument("--seed", type=int, default=1203059356)
++    parser.add_argument("--different-seed", type=int, default=1189844044)
++    parser.add_argument("--output", type=Path, required=True)
++    args = parser.parse_args()
++    if os.environ.get("PYTHONHASHSEED") != "0":
++        raise RuntimeError("Set PYTHONHASHSEED=0 before starting this verification")
++    first_hash = reset_hash(args.env_name, args.seed)
++    repeated_hash = reset_hash(args.env_name, args.seed)
++    different_hash = reset_hash(args.env_name, args.different_seed)
++    report = {
++        "env_name": args.env_name,
++        "seed": args.seed,
++        "different_seed": args.different_seed,
++        "first_hash": first_hash,
++        "repeated_hash": repeated_hash,
++        "different_hash": different_hash,
++        "same_seed_deterministic": first_hash == repeated_hash,
++        "different_seed_changes_observation": first_hash != different_hash,
++    }
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    with args.output.open("w", encoding="utf-8") as file:
++        json.dump(report, file, indent=2)
++        file.write("\n")
++    print(json.dumps(report, indent=2))
++    if not report["same_seed_deterministic"] or not report["different_seed_changes_observation"]:
++        raise RuntimeError("RoboCasa-GR1 seed determinism verification failed")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/Robocasa_tabletop/eval_files/wrappers/video_recording_wrapper.py b/examples/Robocasa_tabletop/eval_files/wrappers/video_recording_wrapper.py
+index cd92b6e..fe351ba 100644
+--- a/examples/Robocasa_tabletop/eval_files/wrappers/video_recording_wrapper.py
++++ b/examples/Robocasa_tabletop/eval_files/wrappers/video_recording_wrapper.py
+@@ -180,6 +180,7 @@ class VideoRecordingWrapper(gym.Wrapper):
+         mode="rgb_array",
+         video_dir: Path | None = None,
+         steps_per_render=1,
++        episode_index_start=0,
+         **kwargs,
+     ):
+         """
+@@ -200,28 +201,38 @@ class VideoRecordingWrapper(gym.Wrapper):
+         self.step_count = 0
+ 
+         self.is_success = False
++        self.episode_index = episode_index_start - 1
++
++    def _finalize_video(self):
++        self.video_recorder.stop()
++        if self.video_dir is None or self.file_path is None or not self.file_path.exists():
++            return
++        original_filestem = self.file_path.stem
++        new_file_path = self.video_dir / f"{original_filestem}_success{int(self.is_success)}.mp4"
++        if new_file_path.exists():
++            raise FileExistsError(f"Refusing to overwrite existing rollout video: {new_file_path}")
++        os.rename(self.file_path, new_file_path)
+ 
+     def reset(self, **kwargs):
++        self._finalize_video()
+         result = super().reset(**kwargs)
+         self.frames = list()
+         self.step_count = 1
+-        self.video_recorder.stop()
+-
+-        if self.video_dir is not None and self.file_path is not None:
+-            # rename the file to indicate success or failure
+-            original_filestem = self.file_path.stem
+-            new_filestem = f"{original_filestem}_success{int(self.is_success)}"
+-            new_file_path = self.video_dir / f"{new_filestem}.mp4"
+-            os.rename(self.file_path, new_file_path)
+-
+         self.is_success = False
++        self.episode_index += 1
+         if self.video_dir is not None:
+-            self.file_path = self.video_dir / f"{uuid.uuid4()}.mp4"
++            seed = kwargs.get("seed")
++            if seed is None:
++                file_stem = f"episode_{self.episode_index:03d}_{uuid.uuid4()}"
++            else:
++                file_stem = f"episode_{self.episode_index:03d}_seed_{int(seed)}"
++            self.file_path = self.video_dir / f"{file_stem}.mp4"
+         return result
+ 
+     def step(self, action):
+         result = super().step(action)
+         self.step_count += 1
++        self.is_success = self.is_success or bool(result[-1]["success"])
+         if self.file_path is not None and ((self.step_count % self.steps_per_render) == 0):
+             if not self.video_recorder.is_ready():
+                 self.video_recorder.start(self.file_path)
+@@ -229,9 +240,14 @@ class VideoRecordingWrapper(gym.Wrapper):
+             frame = self.env.render()
+             assert frame.dtype == np.uint8
+             self.video_recorder.write_frame(frame)
+-            self.is_success = result[-1]["success"]
++        if bool(result[2]) or bool(result[3]):
++            self._finalize_video()
+         return result
+ 
++    def close(self):
++        self._finalize_video()
++        return super().close()
++
+     def render(self, mode="rgb_array", **kwargs):
+         if self.video_recorder.is_ready():
+             self.video_recorder.stop()
+diff --git a/examples/Robocasa_tabletop/run_fixed_seed_eval.sh b/examples/Robocasa_tabletop/run_fixed_seed_eval.sh
+new file mode 100755
+index 0000000..1fac303
+--- /dev/null
++++ b/examples/Robocasa_tabletop/run_fixed_seed_eval.sh
+@@ -0,0 +1,176 @@
++#!/usr/bin/env bash
++
++set -euo pipefail
++
++REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++cd "${REPO_ROOT}"
++
++STARVLA_PYTHON=${STARVLA_PYTHON:-/data/dengyixuan/wyz/.venvs/starvla-cve/bin/python}
++ROBOCASA_PYTHON=${ROBOCASA_PYTHON:-/data/dengyixuan/wyz/.venvs/robocasa-gr1-cve/bin/python}
++CHECKPOINT_PATH=${1:?Usage: $0 CHECKPOINT_PATH [RUN_ROOT]}
++RUN_ROOT=${2:-/data/dengyixuan/wyz/experiments/starvla_robocasa_gr1/$(date +%Y%m%d_%H%M%S)}
++SEED_MANIFEST=${SEED_MANIFEST:-/data/dengyixuan/wyz/experiments/starvla_robocasa_gr1/seeds_24x50_base20260819.json}
++N_EPISODES=${N_EPISODES:-50}
++MAX_EPISODE_STEPS=${MAX_EPISODE_STEPS:-720}
++N_ACTION_STEPS=${N_ACTION_STEPS:-12}
++NUM_GPUS=${NUM_GPUS:-8}
++NUM_WORKERS=${NUM_WORKERS:-${NUM_GPUS}}
++PHYSICAL_GPUS=${PHYSICAL_GPUS:-${NUM_GPUS}}
++BASE_PORT=${BASE_PORT:-6398}
++RECORD_VIDEO=${RECORD_VIDEO:-1}
++POLICY_TRANSPORT=${POLICY_TRANSPORT:-file}
++START_POLICY_SERVERS=${START_POLICY_SERVERS:-1}
++SERVER_ONLY=${SERVER_ONLY:-0}
++SIM_SET_CUDA_VISIBLE_DEVICES=${SIM_SET_CUDA_VISIBLE_DEVICES:-0}
++SEED_OFFSET=${SEED_OFFSET:-0}
++RESULTS_SUBDIR=${RESULTS_SUBDIR:-results}
++VIDEOS_SUBDIR=${VIDEOS_SUBDIR:-videos}
++LOGS_SUBDIR=${LOGS_SUBDIR:-logs}
++SKIP_SUMMARY=${SKIP_SUMMARY:-0}
++export PYTHONHASHSEED=${PYTHONHASHSEED:-0}
++export MUJOCO_GL=${MUJOCO_GL:-egl}
++export TORCH_HOME=${TORCH_HOME:-/data/dengyixuan/wyz/.cache/torch}
++export HF_HOME=${HF_HOME:-/data/dengyixuan/wyz/huggingface}
++export VBENCH_CACHE_DIR=${VBENCH_CACHE_DIR:-/data/dengyixuan/wyz/.cache/vbench}
++export MPLCONFIGDIR=${MPLCONFIGDIR:-/data/dengyixuan/wyz/.cache/matplotlib}
++export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
++export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
++export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
++export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-1}
++export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
++
++mkdir -p "${RUN_ROOT}/${LOGS_SUBDIR}" "${RUN_ROOT}/${RESULTS_SUBDIR}" "${RUN_ROOT}/bridge" "${MPLCONFIGDIR}"
++if [[ ! -f "${SEED_MANIFEST}" ]]; then
++    python examples/Robocasa_tabletop/eval_files/seed_manifest.py \
++        --output "${SEED_MANIFEST}" \
++        --episodes-per-task "${N_EPISODES}"
++fi
++RUN_MANIFEST="${RUN_ROOT}/seed_manifest.json"
++if [[ -f "${RUN_MANIFEST}" ]]; then
++    cmp --silent "${SEED_MANIFEST}" "${RUN_MANIFEST}" || {
++        echo "Seed manifest differs from the one already frozen in ${RUN_ROOT}" >&2
++        exit 1
++    }
++else
++    cp "${SEED_MANIFEST}" "${RUN_MANIFEST}"
++fi
++SEED_MANIFEST="${RUN_MANIFEST}"
++
++mapfile -t TASKS < <(python examples/Robocasa_tabletop/eval_files/seed_manifest.py --list-tasks)
++SERVER_PIDS=()
++EVAL_PIDS=()
++
++cleanup() {
++    for pid in "${EVAL_PIDS[@]:-}"; do
++        kill "${pid}" 2>/dev/null || true
++    done
++    for pid in "${SERVER_PIDS[@]:-}"; do
++        kill "${pid}" 2>/dev/null || true
++    done
++}
++trap cleanup EXIT INT TERM
++
++if [[ "${START_POLICY_SERVERS}" == "1" ]]; then
++    for ((worker = 0; worker < NUM_WORKERS; worker++)); do
++        gpu=$((worker % PHYSICAL_GPUS))
++        port=$((BASE_PORT + worker))
++        bridge_dir="${RUN_ROOT}/bridge/worker${worker}"
++        mkdir -p "${bridge_dir}"
++        server_transport_args=()
++        if [[ "${POLICY_TRANSPORT}" == "file" ]]; then
++            server_transport_args=(--file_bridge_dir "${bridge_dir}")
++        fi
++        CUDA_VISIBLE_DEVICES=${gpu} "${STARVLA_PYTHON}" deployment/model_server/server_policy.py \
++            --ckpt_path "${CHECKPOINT_PATH}" \
++            --port "${port}" \
++            --use_bf16 \
++            "${server_transport_args[@]}" \
++            > "${RUN_ROOT}/${LOGS_SUBDIR}/server_worker${worker}_gpu${gpu}_port${port}.log" 2>&1 &
++        SERVER_PIDS+=("$!")
++    done
++fi
++
++SERVER_READY_TIMEOUT=${SERVER_READY_TIMEOUT:-600}
++for ((worker = 0; worker < NUM_WORKERS; worker++)); do
++    gpu=$((worker % PHYSICAL_GPUS))
++    port=$((BASE_PORT + worker))
++    pid=${SERVER_PIDS[worker]:-}
++    deadline=$((SECONDS + SERVER_READY_TIMEOUT))
++    bridge_dir="${RUN_ROOT}/bridge/worker${worker}"
++    until { [[ "${POLICY_TRANSPORT}" == "file" && -f "${bridge_dir}/metadata.msgpack" ]] || \
++            { [[ "${POLICY_TRANSPORT}" != "file" ]] && (echo > "/dev/tcp/127.0.0.1/${port}") 2>/dev/null; }; }; do
++        if [[ "${START_POLICY_SERVERS}" == "1" ]] && ! kill -0 "${pid}" 2>/dev/null; then
++            echo "Policy server worker ${worker} on GPU ${gpu} exited before becoming ready" >&2
++            tail -n 100 "${RUN_ROOT}/${LOGS_SUBDIR}/server_worker${worker}_gpu${gpu}_port${port}.log" >&2 || true
++            exit 1
++        fi
++        if ((SECONDS >= deadline)); then
++            echo "Timed out waiting for policy server on GPU ${gpu}, port ${port}" >&2
++            exit 1
++        fi
++        sleep 5
++    done
++done
++
++if [[ "${SERVER_ONLY}" == "1" ]]; then
++    if [[ "${START_POLICY_SERVERS}" != "1" ]]; then
++        echo "SERVER_ONLY=1 requires START_POLICY_SERVERS=1" >&2
++        exit 1
++    fi
++    echo "All policy servers are ready under ${RUN_ROOT}/bridge"
++    wait
++    exit 0
++fi
++
++for ((batch_start = 0; batch_start < ${#TASKS[@]}; batch_start += NUM_WORKERS)); do
++    EVAL_PIDS=()
++    for ((worker = 0; worker < NUM_WORKERS; worker++)); do
++        task_index=$((batch_start + worker))
++        if ((task_index >= ${#TASKS[@]})); then
++            break
++        fi
++        task=${TASKS[task_index]}
++        task_slug=${task#*/}
++        gpu=$((worker % PHYSICAL_GPUS))
++        port=$((BASE_PORT + worker))
++        video_args=()
++        if [[ "${RECORD_VIDEO}" == "1" ]]; then
++            mkdir -p "${RUN_ROOT}/${VIDEOS_SUBDIR}/${task_slug}"
++            video_args=(--args.video_out_path "${RUN_ROOT}/${VIDEOS_SUBDIR}/${task_slug}")
++        fi
++        eval_env_args=()
++        if [[ "${SIM_SET_CUDA_VISIBLE_DEVICES}" == "1" ]]; then
++            eval_env_args+=(CUDA_VISIBLE_DEVICES=${gpu})
++        fi
++        if [[ "${POLICY_TRANSPORT}" == "file" ]]; then
++            eval_env_args+=(STARVLA_FILE_BRIDGE_DIR=${RUN_ROOT}/bridge/worker${worker})
++        fi
++        env "${eval_env_args[@]}" "${ROBOCASA_PYTHON}" \
++            examples/Robocasa_tabletop/eval_files/simulation_env.py \
++            --args.env_name "${task}" \
++            --args.port "${port}" \
++            --args.n_episodes "${N_EPISODES}" \
++            --args.n_envs 1 \
++            --args.max_episode_steps "${MAX_EPISODE_STEPS}" \
++            --args.n_action_steps "${N_ACTION_STEPS}" \
++            --args.pretrained_path "${CHECKPOINT_PATH}" \
++            --args.seed_manifest_path "${SEED_MANIFEST}" \
++            --args.seed_offset "${SEED_OFFSET}" \
++            --args.result_out_path "${RUN_ROOT}/${RESULTS_SUBDIR}/${task_slug}.json" \
++            "${video_args[@]}" \
++            > "${RUN_ROOT}/${LOGS_SUBDIR}/eval_${task_slug}_worker${worker}_gpu${gpu}.log" 2>&1 &
++        EVAL_PIDS+=("$!")
++    done
++    for pid in "${EVAL_PIDS[@]}"; do
++        wait "${pid}"
++    done
++done
++
++if [[ "${SKIP_SUMMARY}" != "1" ]]; then
++    "${ROBOCASA_PYTHON}" examples/Robocasa_tabletop/eval_files/summarize_fixed_seed_results.py \
++        --results-dir "${RUN_ROOT}/${RESULTS_SUBDIR}" \
++        --seed-manifest "${SEED_MANIFEST}" \
++        --output "${RUN_ROOT}/summary.json"
++fi
++
++echo "Evaluation complete: ${RUN_ROOT}"
+diff --git a/starVLA/model/framework/__init__.py b/starVLA/model/framework/__init__.py
+index 4c28f8e..a3e9864 100644
+--- a/starVLA/model/framework/__init__.py
++++ b/starVLA/model/framework/__init__.py
+@@ -30,7 +30,7 @@ if pkg_path is not None:
+         for _, module_name, _ in pkgutil.iter_modules(pkg_path):
+             importlib.import_module(f"{__name__}.{module_name}")
+     except Exception as e:
+-        logger.log(f"Warning: Failed to auto-import framework submodules: {e}")
++        logger.warning(f"Failed to auto-import framework submodules: {e}")
+         
+ def build_framework(cfg):
+     """
+-- 
+2.34.1
+

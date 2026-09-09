@@ -1,0 +1,99 @@
+From 09413803a1144e2fd6b76121f046a103e5eb33fe Mon Sep 17 00:00:00 2001
+From: VoyagerTHU <voyager.work@icloud.com>
+Date: Wed, 9 Sep 2026 16:21:30 +0000
+Subject: [PATCH] fix(gr1): seedable resets, milestone signal, HF mirror for
+ asset download
+
+* gymnasium_basic.reset(seed=...) reseeds robosuite's own Generator so
+  scene/object randomization follows the requested seed after the first
+  episode.
+* obj_in_drawer subtask signal uses the same partial obj_inside_of check as
+  task success instead of a fixture-contact test.
+* download_groot_assets honours HF_ENDPOINT for mirrors.
+
+Signed-off-by: VoyagerTHU <voyager.work@icloud.com>
+---
+ .../tabletop/tabletop_drawer_pnp.py            | 18 ++++++++++--------
+ robocasa/scripts/download_groot_assets.py      |  5 +++--
+ robocasa/utils/gym_utils/gymnasium_basic.py    |  7 +++++++
+ 3 files changed, 20 insertions(+), 10 deletions(-)
+
+diff --git a/robocasa/environments/tabletop/tabletop_drawer_pnp.py b/robocasa/environments/tabletop/tabletop_drawer_pnp.py
+index d7bc327..c32322f 100644
+--- a/robocasa/environments/tabletop/tabletop_drawer_pnp.py
++++ b/robocasa/environments/tabletop/tabletop_drawer_pnp.py
+@@ -131,16 +131,20 @@ class TabletopDrawerPnPClose(Tabletop, DexMGConfigHelper):
+         )
+         return cfgs
+ 
+-    def _check_success(self):
+-        """
+-        Check if the object is successfully placed inside the drawer.
+-        """
+-        inside_of_drawer = obj_inside_of(
++    def _check_obj_in_drawer(self):
++        """Return whether the target object's center is inside the drawer."""
++        return obj_inside_of(
+             env=self,
+             obj_name=self.objects["obj"].name,
+             fixture_id=self.drawer,
+             partial_check=True,
+         )
++
++    def _check_success(self):
++        """
++        Check if the object is successfully placed inside the drawer.
++        """
++        inside_of_drawer = self._check_obj_in_drawer()
+         door_state = self.drawer.get_door_state(env=self)["door"]
+         door_state_correct = (
+             door_state >= 0.5 if self.behavior == "open" else door_state <= 0.005
+@@ -172,9 +176,7 @@ class TabletopDrawerPnPClose(Tabletop, DexMGConfigHelper):
+                 object_geoms=self.objects["obj"],
+             )
+         )
+-        signals["obj_in_drawer"] = int(
+-            OU.check_obj_fixture_contact(self, "obj", self.drawer)
+-        )
++        signals["obj_in_drawer"] = int(self._check_obj_in_drawer())
+ 
+         return signals
+ 
+diff --git a/robocasa/scripts/download_groot_assets.py b/robocasa/scripts/download_groot_assets.py
+index 0dd6385..3460a4b 100644
+--- a/robocasa/scripts/download_groot_assets.py
++++ b/robocasa/scripts/download_groot_assets.py
+@@ -12,8 +12,9 @@ from download_kitchen_assets import download_kitchen_assets as download
+ 
+ DEFAULT_ASSETS_VERSION = "1b018839a6da865dffecd3185fe054211bc71270"
+ REPO_ID = "nvidia/PhysicalAI-DigitalCousin-Assets"
+-API_URL = f"https://huggingface.co/api/datasets/{REPO_ID}"
+-SOURCE_URL = f"https://huggingface.co/datasets/{REPO_ID}"
++HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
++API_URL = f"{HF_ENDPOINT}/api/datasets/{REPO_ID}"
++SOURCE_URL = f"{HF_ENDPOINT}/datasets/{REPO_ID}"
+ 
+ 
+ class Registry(enum.Enum):
+diff --git a/robocasa/utils/gym_utils/gymnasium_basic.py b/robocasa/utils/gym_utils/gymnasium_basic.py
+index 91b1103..9cb233a 100644
+--- a/robocasa/utils/gym_utils/gymnasium_basic.py
++++ b/robocasa/utils/gym_utils/gymnasium_basic.py
+@@ -211,7 +211,14 @@ class RoboCasaEnv(gym.Env):
+         return raw_obs
+ 
+     def reset(self, seed=None, options=None):
++        # robosuite owns a Generator that is created in its constructor. Merely
++        # seeding NumPy's legacy global RNG does not reseed that Generator, so
++        # Gymnasium's reset(seed=...) contract would otherwise be ineffective
++        # for RoboCasa scene / object randomization after the first episode.
+         np.random.seed(seed)
++        if seed is not None:
++            self.env.seed = seed
++            self.env.rng = np.random.default_rng(seed)
+         raw_obs = self.env.reset()
+         # return obs
+         obs = self.get_basic_observation(raw_obs)
+-- 
+2.34.1
+
