@@ -287,6 +287,24 @@ global-batch proximal and reference KL, the coefficient used and its next
 value, and whether the trust region or optimizer-step limit stopped the
 remaining minibatches.
 
+``robocasa_gr1_cup_drawer_ppo_starvla.yaml`` is the GAE / value-head variant.
+Its critic is a zero-initialized FP32 linear head (``value_head_zero_init``),
+actor and critic parameter groups are clipped separately
+(``optim.clip_grad_per_group`` with ``clip_grad`` / ``value_clip_grad``), and a
+soft critic warmup (``optim.critic_warmup_steps`` with
+``critic_warmup_mode: soft``) drops the actor gradients for the first
+optimizer steps without toggling ``requires_grad`` on the FSDP-wrapped model.
+``critic/explained_variance`` is recombined from per-micro-batch sufficient
+statistics at the update level; the raw per-micro-batch value is kept as
+``critic/explained_variance_micro_batch``.
+
+``robocasa_gr1_cup_drawer_sac_starvla.yaml`` (twin-Q SAC) stores a
+``transition_valid`` flag with every replay transition so steps after an
+episode already terminated (no auto-reset) get zero weight in the critic and
+actor losses, and it fails fast if ``actor.model.sac_task_description`` differs
+from the instruction the environment emits, because replayed forwards rebuild
+the prompt from that string.
+
 Grouped GRPO requires ``env`` and ``actor`` to have the same world size (or at
 least that every trajectory piece an actor rank receives holds whole seed
 groups): environment workers split their rollouts across actor ranks by batch

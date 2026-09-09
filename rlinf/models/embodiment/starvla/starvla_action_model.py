@@ -80,6 +80,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         num_q_heads: int = 2,
         q_hidden_dims: tuple[int, ...] = (512, 256),
         sac_task_description: Optional[str] = None,
+        value_head_zero_init: bool = True,
     ):
         super().__init__()
 
@@ -131,24 +132,26 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
 
         # 5) RL heads/params (optional value head + Gaussian log-std).
         hidden_size = (
-            infer_hidden_size(starvla_model)
-            if add_value_head or add_q_head
-            else None
+            infer_hidden_size(starvla_model) if add_value_head or add_q_head else None
         )
         self.value_head: Optional[nn.Module] = None
         if add_value_head:
             # The head is randomly initialized and optimized separately from
             # the policy.  Keeping its two small tensors in FP32 avoids losing
             # 1e-4-scale critic updates to the BF16 checkpoint grid.
-            self.value_head = StarVLAValueHead(
-                hidden_size, 1, dtype=torch.float32
-            )
+            self.value_head = StarVLAValueHead(hidden_size, 1, dtype=torch.float32)
+            if value_head_zero_init:
+                # Sparse binary returns start near zero. A randomly initialized
+                # linear head on Qwen3-VL hidden states predicts values of
+                # magnitude ~10, which makes the first dozens of GAE updates
+                # fit noise and dominates a model-wide gradient clip.
+                nn.init.zeros_(self.value_head.weight)
+                if self.value_head.bias is not None:
+                    nn.init.zeros_(self.value_head.bias)
 
         self.q_head: Optional[nn.Module] = None
         if add_q_head:
-            action_feature_dim = (
-                self.num_executed_action_chunks * self.action_dim
-            )
+            action_feature_dim = self.num_executed_action_chunks * self.action_dim
             self.q_head = StarVLAMultiQHead(
                 hidden_size=hidden_size,
                 action_feature_dim=action_feature_dim,
@@ -163,20 +166,18 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
                 if critic.net[-1].bias is not None:
                     nn.init.zeros_(critic.net[-1].bias)
         self.sac_task_description = (
-            None
-            if sac_task_description is None
-            else str(sac_task_description).strip()
+            None if sac_task_description is None else str(sac_task_description).strip()
         )
 
         action_model = getattr(starvla_model, "action_model", None)
-        action_param_dtype = next(
-            (
-                p.dtype
-                for p in action_model.parameters()
-                if p.is_floating_point()
-            ),
-            policy_param_dtype,
-        ) if isinstance(action_model, nn.Module) else policy_param_dtype
+        action_param_dtype = (
+            next(
+                (p.dtype for p in action_model.parameters() if p.is_floating_point()),
+                policy_param_dtype,
+            )
+            if isinstance(action_model, nn.Module)
+            else policy_param_dtype
+        )
         actor_logstd = torch.full(
             (self.action_dim,), float(initial_logstd), dtype=action_param_dtype
         )
@@ -203,6 +204,30 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             and self._rollout_prompt_seq_len <= 0
         ):
             raise ValueError("rollout_prompt_seq_len must be positive when provided")
+
+    def _check_sac_task_description(self, env_obs: dict[str, Any]) -> None:
+        """Fail fast when replay-time prompts would differ from rollout prompts.
+
+        Replay storage keeps tensors only, so SAC actor/critic forwards rebuild
+        the prompt from ``sac_task_description``. If that string does not match
+        the instruction the environment actually emitted, every Q value and
+        actor gradient is computed under a prompt that is never deployed.
+        """
+        if self.sac_task_description is None or not isinstance(env_obs, dict):
+            return
+        observed = env_obs.get("task_descriptions")
+        if observed is None:
+            return
+        mismatched = sorted(
+            {str(text) for text in observed if str(text) != self.sac_task_description}
+        )
+        if mismatched:
+            raise ValueError(
+                "actor.model.sac_task_description does not match the environment "
+                f"instruction. configured={self.sac_task_description!r}, "
+                f"observed={mismatched[:3]!r}. Replayed SAC forwards would use a "
+                "prompt the rollout policy never sees."
+            )
 
     @torch.no_grad()
     def restore_configured_fixed_actor_logstd(self) -> None:
@@ -351,9 +376,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             shared_feature = shared_feature.detach()
         actions = actions.reshape(actions.shape[0], -1)
         q_dtype = next(self.q_head.parameters()).dtype
-        return self.q_head(
-            shared_feature.to(dtype=q_dtype), actions.to(dtype=q_dtype)
-        )
+        return self.q_head(shared_feature.to(dtype=q_dtype), actions.to(dtype=q_dtype))
 
     def default_forward(
         self,
@@ -438,6 +461,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         del return_obs
         if self.value_head is None:
             calculate_values = False
+        self._check_sac_task_description(env_obs)
 
         if self.policy_setup == "gr1":
             from .utils.vlm_preprocess import get_train_image_size

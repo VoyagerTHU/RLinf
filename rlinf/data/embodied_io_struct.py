@@ -363,6 +363,10 @@ class ChunkStepResult:
             self.versions = self.versions.cpu().contiguous()
 
 
+# Key under ``curr_obs`` carrying the per-transition replay validity mask.
+TRANSITION_VALID_KEY = "transition_valid"
+
+
 @dataclass
 class Trajectory:
     """
@@ -613,7 +617,17 @@ class EmbodiedRolloutResult:
                     )
                 last_fi.pop("model_action", None)
 
-    def append_transitions(self, curr_obs=None, next_obs=None):
+    def append_transitions(self, curr_obs=None, next_obs=None, valid=None):
+        """Store one chunk-step transition batch for the replay buffer.
+
+        Args:
+            curr_obs: Observation the action was computed from.
+            next_obs: Observation after executing the action chunk.
+            valid: Optional ``[B]`` boolean mask; ``False`` marks environments
+                whose episode had already terminated before this action (no
+                auto-reset), so the transition must not be used as a training
+                sample. Stored as ``curr_obs["transition_valid"]`` ``[B, 1]``.
+        """
         assert curr_obs is not None and next_obs is not None
         # Replay storage accepts tensor fields only. Do not pop the language
         # field from the live environment observation: the same dictionary may
@@ -624,6 +638,9 @@ class EmbodiedRolloutResult:
         stored_next_obs = {
             key: value for key, value in next_obs.items() if key != "task_descriptions"
         }
+        if valid is not None:
+            valid = torch.as_tensor(valid).reshape(-1, 1).to(torch.bool)
+            stored_curr_obs[TRANSITION_VALID_KEY] = valid
         self.curr_obs.append(stored_curr_obs)
         self.next_obs.append(stored_next_obs)
 

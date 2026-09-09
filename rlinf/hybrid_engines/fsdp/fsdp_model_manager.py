@@ -33,6 +33,7 @@ from rlinf.hybrid_engines.fsdp import (
 )
 from rlinf.hybrid_engines.fsdp.strategy.base import FSDPStrategyBase
 from rlinf.hybrid_engines.fsdp.utils import (
+    clip_grad_norm_per_group_,
     create_device_mesh,
     get_lr_scheduler,
 )
@@ -71,6 +72,25 @@ class FSDPModelManager:
         ) and self._cfg.model.get("add_value_head", False):
             self.critic_warmup_steps = self._cfg.optim.critic_warmup_steps
         self.store_requires_grad_param_name = []
+        # "freeze" (legacy) toggles requires_grad on the already wrapped model
+        # when the warmup ends, which FSDP1 + use_orig_params does not support
+        # reliably. "soft" keeps the optimizer fixed and simply drops the
+        # non-critic gradients during warmup (the policy loss is zero anyway).
+        self.critic_warmup_mode = str(
+            self._cfg.get("optim", {}).get("critic_warmup_mode", "freeze")
+        ).lower()
+        if self.critic_warmup_mode not in ("freeze", "soft"):
+            raise ValueError(
+                "optim.critic_warmup_mode must be 'freeze' or 'soft', got "
+                f"{self.critic_warmup_mode!r}."
+            )
+        # Clip each optimizer group (actor / critic) to its own norm budget
+        # instead of one model-wide norm, so a large critic gradient cannot
+        # scale the actor gradient to zero.
+        self.clip_grad_per_group = bool(
+            self._cfg.get("optim", {}).get("clip_grad_per_group", False)
+        )
+        self.last_grad_norms: dict[str, float] = {}
 
         if cfg.get("tokenizer", {}).get("tokenizer_model", None) is not None:
             self.tokenizer = hf_tokenizer(cfg.tokenizer.tokenizer_model)
@@ -272,7 +292,10 @@ class FSDPModelManager:
             model=module, device_mesh=self._device_mesh
         )
         self.optimizer = self.build_optimizer(
-            model=self.model, enable_critic_warmup=self.critic_warmup_steps > 0
+            model=self.model,
+            enable_critic_warmup=(
+                self.critic_warmup_steps > 0 and self.critic_warmup_mode == "freeze"
+            ),
         )
 
         self.lr_scheduler = self.build_lr_scheduler(
@@ -403,11 +426,32 @@ class FSDPModelManager:
         Returns:
             A tuple of (grad_norm, lr_list), lr_list contains learning rates for all param groups.
         """
+        soft_warmup_active = (
+            self.critic_warmup_mode == "soft"
+            and self.optimizer_steps < self.critic_warmup_steps
+        )
         self.optimizer_steps += 1
         self.grad_scaler.unscale_(self.optimizer)
-        grad_norm = self._strategy.clip_grad_norm_(
-            model=self.model,
-        )
+        if soft_warmup_active:
+            # Only the critic learns during a soft warmup. Dropping the other
+            # groups' gradients makes AdamW skip those parameters entirely, so
+            # neither their weights nor their moment estimates move.
+            for group in self.optimizer.param_groups:
+                if group.get("name") != "critic":
+                    for param in group["params"]:
+                        param.grad = None
+            if self.optimizer_steps == self.critic_warmup_steps:
+                self._logger.info(
+                    "[FSDP] Soft critic warmup finished after %d optimizer steps.",
+                    self.critic_warmup_steps,
+                )
+
+        if self.clip_grad_per_group:
+            grad_norm = self._clip_grad_norm_per_group()
+        else:
+            grad_norm = self._strategy.clip_grad_norm_(
+                model=self.model,
+            )
 
         if not torch.isfinite(torch.as_tensor(grad_norm)):
             self._logger.warning(
@@ -418,7 +462,7 @@ class FSDPModelManager:
 
         self.grad_scaler.update()
 
-        if self.critic_warmup_steps > 0:
+        if self.critic_warmup_steps > 0 and self.critic_warmup_mode == "freeze":
             lr_list = [0.0 for _ in self.optimizer.param_groups]
             if self.optimizer_steps >= self.critic_warmup_steps:
                 self.optimizer = self.build_optimizer(model=self.model)
@@ -427,6 +471,40 @@ class FSDPModelManager:
             lr_list = [group["lr"] for group in self.optimizer.param_groups]
 
         return grad_norm, lr_list
+
+    def _clip_grad_norm_per_group(self) -> float:
+        """Clip actor and critic parameter groups to separate norm budgets.
+
+        Returns:
+            The pre-clip norm of the actor group (or of the first group when no
+            group is named ``actor``), matching ``clip_grad_norm_``'s contract.
+        """
+        if self._dp_group is not None:
+            raise NotImplementedError(
+                "optim.clip_grad_per_group is only implemented for fully sharded "
+                "(non-hybrid) FSDP setups."
+            )
+        reduce_group = (
+            torch.distributed.group.WORLD
+            if torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+            else None
+        )
+        default_max_norm = float(self._cfg.optim.clip_grad)
+        max_norms = {
+            "actor": default_max_norm,
+            "critic": float(self._cfg.optim.get("value_clip_grad", default_max_norm)),
+        }
+        self.last_grad_norms = clip_grad_norm_per_group_(
+            self.optimizer.param_groups,
+            max_norms=max_norms,
+            default_max_norm=default_max_norm,
+            reduce_group=reduce_group,
+            device=self.device,
+        )
+        if "actor" in self.last_grad_norms:
+            return self.last_grad_norms["actor"]
+        return next(iter(self.last_grad_norms.values()), 0.0)
 
     def build_lr_scheduler(
         self, optimizer: Optimizer, optim_config: DictConfig
@@ -508,6 +586,7 @@ class FSDPModelManager:
         if len(params_actor) > 0:
             param_groups.append(
                 {
+                    "name": "actor",
                     "params": params_actor,
                     "lr": self._cfg.optim.lr,
                     "betas": betas,
@@ -516,6 +595,7 @@ class FSDPModelManager:
         if len(params_critic) > 0:
             param_groups.append(
                 {
+                    "name": "critic",
                     "params": params_critic,
                     "lr": self._cfg.optim.value_lr,
                     "betas": betas,

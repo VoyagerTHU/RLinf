@@ -692,6 +692,62 @@ def get_grad_norm(
     return float(total_norm)
 
 
+@torch.no_grad()
+def clip_grad_norm_per_group_(
+    param_groups,
+    *,
+    max_norms: dict[str, float],
+    default_max_norm: float,
+    reduce_group,
+    device: torch.device,
+) -> dict[str, float]:
+    """Clip every optimizer parameter group to its own L2 norm budget.
+
+    A single model-wide clip lets one group with large gradients (for example a
+    freshly initialized value head) scale the gradients of every other group
+    down by the same factor, which can freeze the policy. Clipping per group
+    keeps the budgets independent.
+
+    Gradients are assumed to be sharded across ``reduce_group`` (FSDP
+    ``FULL_SHARD`` with ``use_orig_params``, or FSDP2), so the squared norms
+    are summed across that group before taking the square root. Every rank
+    participates in the reduction for every group, even when it holds no
+    gradient elements, which keeps the collectives aligned.
+
+    Args:
+        param_groups: ``optimizer.param_groups``; a group's ``"name"`` key
+            selects its entry in ``max_norms``.
+        max_norms: Per-group maximum norms keyed by group name.
+        default_max_norm: Budget for groups without an entry in ``max_norms``.
+        reduce_group: Process group holding the gradient shards, or ``None``
+            when gradients are not sharded.
+        device: Device used for the reduction scalars.
+
+    Returns:
+        The pre-clip total norm of every group, keyed by group name.
+    """
+    norms: dict[str, float] = {}
+    for index, group in enumerate(param_groups):
+        name = str(group.get("name", index))
+        params = [p for p in group["params"] if p.grad is not None]
+        local_sq = torch.zeros((), dtype=torch.float32, device=device)
+        for p in params:
+            local_sq += to_local_if_dtensor(p.grad.detach()).float().pow(2).sum()
+        if reduce_group is not None and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                local_sq, op=torch.distributed.ReduceOp.SUM, group=reduce_group
+            )
+        total_norm = float(local_sq.sqrt().item())
+        if params:
+            clip_grad_by_total_norm_(
+                params,
+                max_grad_norm=float(max_norms.get(name, default_max_norm)),
+                total_norm=total_norm,
+            )
+        norms[name] = total_norm
+    return norms
+
+
 def get_grad_norm_for_mixed_precision(
     params: Iterable[torch.nn.Parameter],
     norm_type: float,

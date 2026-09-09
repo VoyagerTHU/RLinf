@@ -1022,6 +1022,13 @@ class EnvWorker(Worker):
                 self._prefetched_train_bootstrap = None
             else:
                 env_outputs = self._bootstrap_and_send_train(rollout_channel)
+            # Without auto-reset, finished episodes keep stepping until the
+            # rollout epoch ends. PPO masks those steps through the loss mask;
+            # replay-buffer consumers need an explicit per-transition flag.
+            train_done_once = [
+                torch.zeros(self.train_num_envs_per_stage, dtype=torch.bool)
+                for _ in range(self.stage_num)
+            ]
 
             for chunk_step_idx in range(self.n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
@@ -1097,7 +1104,15 @@ class EnvWorker(Worker):
                             else env_output.obs
                         )
                         self.rollout_results[stage_id].append_transitions(
-                            curr_obs, next_obs
+                            curr_obs,
+                            next_obs,
+                            valid=~train_done_once[stage_id],
+                        )
+                    if not self.cfg.env.train.auto_reset:
+                        train_done_once[stage_id] |= (
+                            env_output.dones.reshape(env_output.dones.shape[0], -1)
+                            .any(dim=-1)
+                            .cpu()
                         )
 
                     env_outputs[stage_id] = env_output

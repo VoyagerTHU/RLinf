@@ -18,7 +18,6 @@ from typing import Optional
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
@@ -28,7 +27,7 @@ from rlinf.data.embodied_buffer_dataset import (
     ReplayBufferDataset,
     replay_buffer_collate_fn,
 )
-from rlinf.data.embodied_io_struct import Trajectory
+from rlinf.data.embodied_io_struct import TRANSITION_VALID_KEY, Trajectory
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
@@ -45,6 +44,51 @@ from rlinf.utils.nested_dict_process import (
 )
 from rlinf.utils.utils import clear_memory
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+
+
+def pop_transition_valid(batch: dict) -> Optional[torch.Tensor]:
+    """Remove the replay validity mask from a sampled batch and return it.
+
+    The mask travels inside ``curr_obs`` so that the replay buffer can store it
+    like any other observation tensor. It must not reach the policy forward
+    (observation dicts are converted to model inputs key by key).
+
+    Returns:
+        A ``[B, 1]`` float tensor, or ``None`` when the batch carries no mask.
+    """
+    valid = None
+    for obs_key in ("curr_obs", "next_obs"):
+        obs = batch.get(obs_key)
+        if isinstance(obs, dict) and TRANSITION_VALID_KEY in obs:
+            popped = obs.pop(TRANSITION_VALID_KEY)
+            if valid is None:
+                valid = popped
+    if valid is None:
+        return None
+    return valid.reshape(valid.shape[0], -1)[:, :1].to(torch.float32)
+
+
+def masked_transition_mean(
+    values: torch.Tensor, valid: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Average ``values`` over valid transitions only.
+
+    ``values`` is ``[B, ...]``; ``valid`` is ``[B, 1]`` (or ``None`` for all
+    valid). Invalid transitions (steps after an episode already terminated)
+    receive zero weight so they neither shape the critic target fit nor the
+    actor objective. An all-invalid micro-batch yields a zero loss that still
+    carries a graph, so gradient accumulation stays well defined.
+    """
+    if valid is None:
+        return values.mean()
+    valid = valid.to(device=values.device, dtype=values.dtype)
+    weight = valid.reshape(valid.shape[0], *([1] * (values.dim() - 1))).expand_as(
+        values
+    )
+    denominator = weight.sum()
+    if denominator <= 0:
+        return (values * weight).sum() * 0.0
+    return (values * weight).sum() / denominator
 
 
 class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
@@ -137,9 +181,20 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             dtype=self.torch_dtype,
         )
         if alpha_type != "fixed_alpha":
+            # log_pi is summed over every executed action dimension, so the
+            # default target must cover the whole executed chunk rather than a
+            # single action vector.
+            executed_action_dims = int(self.cfg.actor.model.action_dim)
+            if self.cfg.actor.model.model_type == "starvla":
+                executed_action_dims *= int(
+                    self.cfg.actor.model.get(
+                        "num_executed_action_chunks",
+                        self.cfg.actor.model.get("num_action_chunks", 1),
+                    )
+                )
             self.target_entropy = self.cfg.algorithm.entropy_tuning.get(
                 "target_entropy",
-                -self.cfg.actor.model.action_dim,
+                -executed_action_dims,
             )
 
             self.alpha_optimizer = torch.optim.Adam(
@@ -280,6 +335,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 ):
                     assert name1 == name2
                     if "q_head" not in name1:
+                        if not online_param.requires_grad:
+                            # Frozen (e.g. VLM backbone) parameters never
+                            # diverge from the target copy; skip the copy.
+                            continue
                         if self.target_update_type == "all":
                             target_param.data.mul_(1.0 - tau)
                             target_param.data.add_(online_param.data * tau)
@@ -355,7 +414,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     "num_executed_action_chunks",
                     self.cfg.actor.model.get("num_action_chunks", 1),
                 )
-                discount = self.cfg.algorithm.gamma**int(executed_chunks)
+                discount = self.cfg.algorithm.gamma ** int(executed_chunks)
             else:
                 discount = self.cfg.algorithm.gamma
             rewards_for_bootstrap = (
@@ -479,10 +538,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         # Align dtype: bool ops with Python floats promote to float32,
         # which can mismatch with bfloat16 model outputs.
         target_q_values = target_q_values.to(dtype=all_data_q_values.dtype)
-        critic_loss = F.mse_loss(
-            all_data_q_values, target_q_values.expand_as(all_data_q_values)
-        )
-        return critic_loss, {"q_data": all_data_q_values.mean().item()}
+        transition_valid = batch.get(TRANSITION_VALID_KEY)
+        squared_error = (
+            all_data_q_values - target_q_values.expand_as(all_data_q_values)
+        ).square()
+        critic_loss = masked_transition_mean(squared_error, transition_valid)
+        metrics = {"q_data": all_data_q_values.mean().item()}
+        if transition_valid is not None:
+            metrics["transition_valid_fraction"] = transition_valid.mean().item()
+        return critic_loss, metrics
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
@@ -537,7 +601,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         elif agg_q == "mean":
             qf_pi = torch.mean(all_qf_pi, dim=1, keepdim=True)
         metrics["q_pi"] = qf_pi.mean().item()
-        actor_loss = ((self.entropy_temp.alpha * log_pi) - qf_pi).mean()
+        transition_valid = batch.get(TRANSITION_VALID_KEY)
+        actor_loss = masked_transition_mean(
+            (self.entropy_temp.alpha * log_pi) - qf_pi, transition_valid
+        )
 
         entropy = -log_pi.mean()
         return actor_loss, entropy, metrics
@@ -581,6 +648,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         # move train_micro_batch_list to device and apply DRQ for critic/actor/alpha passes
         for i, batch in enumerate(train_micro_batch_list):
             batch = put_tensor_device(batch, device=self.device)
+            transition_valid = pop_transition_valid(batch)
+            if transition_valid is not None:
+                batch[TRANSITION_VALID_KEY] = transition_valid
             if self.enable_drq:
                 drq.apply_drq(batch["curr_obs"], pad=4)
                 drq.apply_drq(batch["next_obs"], pad=4)
@@ -882,9 +952,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 full_state_dict=True,
             )
             del model_state_dict
-            resume_state_path = os.path.join(
-                load_base_path, "sac_resume_state.pt"
+            # A checkpoint from another run may carry a different fixed
+            # exploration scale; the configured value must win.
+            restore_fixed_logstd = getattr(
+                self.model, "restore_configured_fixed_actor_logstd", None
             )
+            if restore_fixed_logstd is not None:
+                restore_fixed_logstd()
+            resume_state_path = os.path.join(load_base_path, "sac_resume_state.pt")
             if os.path.isfile(resume_state_path):
                 resume_state = torch.load(
                     resume_state_path, map_location="cpu", weights_only=True

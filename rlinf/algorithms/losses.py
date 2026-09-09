@@ -52,6 +52,11 @@ def compute_decoupled_ppo_actor_loss(
 
     if loss_mask is None:
         loss_mask = torch.ones_like(logprobs).bool()
+    elif loss_mask.shape != logprobs.shape:
+        # Embodied token-level ratios receive a [B, 1, 1] chunk mask. Expand it
+        # up front so the element counts behind approx_kl / clip_fraction match
+        # the elements the loss averages over.
+        loss_mask = loss_mask.expand_as(logprobs)
 
     loss_mask_ratio = None
     if (
@@ -225,6 +230,12 @@ def compute_ppo_actor_loss(
 
     if loss_mask is None:
         loss_mask = torch.ones_like(logprobs).bool()
+    elif loss_mask.shape != logprobs.shape:
+        # Embodied token-level ratios receive a [B, 1, 1] chunk mask. Expand it
+        # up front so the element counts behind approx_kl / clip_fraction match
+        # the elements the loss averages over (otherwise both are inflated by
+        # the number of action dimensions per chunk).
+        loss_mask = loss_mask.expand_as(logprobs)
 
     assert logprobs.dtype == torch.float32, (
         "logprobs must be float32 to keep numerical stability"
@@ -362,11 +373,16 @@ def compute_ppo_critic_loss(
 
     # explained variance
     if loss_mask is not None:
-        masked_returns = returns[loss_mask]
-        masked_values = values[loss_mask]
+        valid = loss_mask.to(dtype=torch.bool)
+        if valid.shape != returns.shape:
+            valid = valid.expand_as(returns)
+        masked_returns = returns[valid]
+        masked_values = values[valid]
     else:
-        masked_returns = returns
-        masked_values = values
+        masked_returns = returns.reshape(-1)
+        masked_values = values.reshape(-1)
+    masked_returns = masked_returns.detach().float()
+    masked_values = masked_values.detach().float()
 
     # A masked micro-batch may contain only one valid transition.  The default
     # Bessel correction makes ``torch.var`` return NaN in that case, and one
@@ -383,11 +399,19 @@ def compute_ppo_critic_loss(
         else:
             explained_variance = 1 - var_diff / var_returns
 
-    # Compile metrics for logging
+    # Compile metrics for logging. The per-micro-batch explained variance is
+    # meaningless for tiny micro-batches (its denominator is the variance of a
+    # handful of returns), so also emit the sufficient statistics; the actor
+    # worker recombines them into an update-level explained variance after
+    # averaging across micro-batches and ranks.
     metrics_data = {
         "critic/value_loss": value_loss.detach(),
         "critic/value_clip_ratio": value_clip_ratio.detach(),
         "critic/explained_variance": explained_variance.detach(),
+        "critic/ev_count": float(masked_returns.numel()),
+        "critic/ev_sq_error_sum": (masked_returns - masked_values).square().sum(),
+        "critic/ev_returns_sum": masked_returns.sum(),
+        "critic/ev_returns_sq_sum": masked_returns.square().sum(),
     }
     return value_loss, metrics_data
 

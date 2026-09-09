@@ -191,6 +191,46 @@ def adapt_kl_beta(
     return float(min(max(kl_beta, min_beta), max_beta))
 
 
+def compute_update_level_explained_variance(
+    metrics: dict[str, float],
+    *,
+    count_key: str = "critic/ev_count",
+    sq_error_key: str = "critic/ev_sq_error_sum",
+    returns_key: str = "critic/ev_returns_sum",
+    returns_sq_key: str = "critic/ev_returns_sq_sum",
+) -> dict[str, float]:
+    """Recombine per-micro-batch critic statistics into one explained variance.
+
+    ``compute_ppo_critic_loss`` reports masked sums per micro-batch. After the
+    actor averages metrics over micro-batches (and ranks) every sum is scaled
+    by the same factor, so the ratios below still equal the update-level
+    ``1 - MSE / Var(returns)``. The per-micro-batch value is kept under
+    ``critic/explained_variance_micro_batch`` for reference.
+
+    Returns:
+        Keys to merge into ``metrics``; empty when the statistics are absent.
+    """
+    if count_key not in metrics:
+        return {}
+    count = float(metrics[count_key])
+    result = {
+        "critic/explained_variance_micro_batch": float(
+            metrics.get("critic/explained_variance", 0.0)
+        )
+    }
+    if count <= 0:
+        result["critic/explained_variance"] = 0.0
+        return result
+    mean_returns = float(metrics[returns_key]) / count
+    var_returns = float(metrics[returns_sq_key]) / count - mean_returns**2
+    mse = float(metrics[sq_error_key]) / count
+    if not math.isfinite(var_returns) or var_returns <= 1e-12:
+        result["critic/explained_variance"] = 0.0
+    else:
+        result["critic/explained_variance"] = 1.0 - mse / var_returns
+    return result
+
+
 def huber_loss(error: torch.Tensor, delta: float) -> torch.Tensor:
     return torch.where(
         error.abs() < delta, 0.5 * error**2, delta * (error.abs() - 0.5 * delta)

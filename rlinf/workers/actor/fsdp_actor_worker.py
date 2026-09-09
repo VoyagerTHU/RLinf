@@ -31,6 +31,7 @@ from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
     adapt_kl_beta,
     compute_embodied_reference_kl,
+    compute_update_level_explained_variance,
     kl_penalty,
     positive_advantage_sample_mask,
     prioritize_positive_advantage_samples,
@@ -1999,7 +2000,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     reference_kl_loss = torch.tensor(
                         0.0, device=Worker.torch_platform.current_device()
                     )
-                    if self.kl_beta > 0:
+                    # During a critic warmup the policy must not move at all,
+                    # so the reference penalty is skipped together with the
+                    # policy loss.
+                    if self.kl_beta > 0 and not kwargs["critic_warmup"]:
                         ref_logprobs = batch.get("ref_logprobs", None)
                         if ref_logprobs is None:
                             raise RuntimeError(
@@ -2150,6 +2154,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 }
                 if len(lr_list) > 1:
                     data["critic/lr"] = lr_list[1]
+                for group_name, group_norm in self.last_grad_norms.items():
+                    data[f"{group_name}/grad_norm_pre_clip"] = float(group_norm)
                 append_to_dict(metrics, data)
                 if (
                     max_optimizer_steps_per_update is not None
@@ -2256,6 +2262,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
+        )
+        mean_metric_dict.update(
+            compute_update_level_explained_variance(mean_metric_dict)
         )
         self.log_on_first_rank(
             "Embodied actor KL/update summary: "
