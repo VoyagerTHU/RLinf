@@ -198,6 +198,11 @@ actor:
     # the +-10 a random head produces on these hidden states.
     add_value_head: true
     value_head_zero_init: true
+    # PPO: normalize the critic input. The raw Qwen3-VL last-layer hidden
+    # state has massive-activation dimensions; a bare linear head on it saw
+    # pre-clip gradient norms of 1e3-6e3, bootstrapped returns swinging to
+    # negative means, and explained variance < 0 for 20 updates.
+    value_head_input_norm: layer_norm
     initial_logstd: -3.5
     trainable_logstd: false
     use_proprio: false

@@ -301,6 +301,7 @@ def get_model(
         q_hidden_dims=tuple(getattr(cfg, "q_hidden_dims", (512, 256))),
         sac_task_description=getattr(cfg, "sac_task_description", None),
         value_head_zero_init=bool(getattr(cfg, "value_head_zero_init", True)),
+        value_head_input_norm=getattr(cfg, "value_head_input_norm", "layer_norm"),
     )
 
 

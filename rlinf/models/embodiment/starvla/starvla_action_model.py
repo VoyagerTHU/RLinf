@@ -41,8 +41,62 @@ from .utils.profile import (
 logger = logging.getLogger(__name__)
 
 
-class StarVLAValueHead(nn.Linear):
-    """Small PPO critic head that can be targeted by FSDP wrap policies."""
+class StarVLAValueHead(nn.Module):
+    """Linear PPO critic on a normalized backbone feature (FSDP wrap target).
+
+    The critic reads the last-layer hidden state of a Qwen3-VL token. Those
+    hidden states carry a few massive-activation dimensions (magnitudes in the
+    hundreds to thousands), so a bare linear head sees critic gradient norms of
+    ~1e3-1e4, oscillates with Adam at value_lr 1e-4, and its bootstrapped GAE
+    returns swing negative (explained variance stayed below zero for 20
+    updates on RoboCasa GR1). Normalizing the feature first (LayerNorm without
+    affine parameters, or RMS) puts the head on a unit-scale input.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        input_norm: Optional[str] = "layer_norm",
+        zero_init: bool = True,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        norm = str(input_norm or "none").strip().lower()
+        if norm == "layer_norm":
+            self.norm: nn.Module = nn.LayerNorm(
+                hidden_size, eps=eps, elementwise_affine=False, dtype=torch.float32
+            )
+        elif norm == "rms":
+            self.norm = _RMSNorm(eps=eps)
+        elif norm == "none":
+            self.norm = nn.Identity()
+        else:
+            raise ValueError(
+                "value_head_input_norm must be one of 'layer_norm', 'rms', 'none', "
+                f"got {input_norm!r}"
+            )
+        self.proj = nn.Linear(hidden_size, 1, dtype=torch.float32)
+        if zero_init:
+            # Sparse binary returns start near zero. A randomly initialized head
+            # predicts values of magnitude ~10 on these features and makes the
+            # first dozens of GAE updates fit noise.
+            nn.init.zeros_(self.proj.weight)
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.proj(self.norm(features.to(dtype=torch.float32)))
+
+
+class _RMSNorm(nn.Module):
+    """Parameter-free RMS normalization over the last dimension."""
+
+    def __init__(self, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
 
 class StarVLAMultiQHead(MultiQHead):
@@ -81,6 +135,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         q_hidden_dims: tuple[int, ...] = (512, 256),
         sac_task_description: Optional[str] = None,
         value_head_zero_init: bool = True,
+        value_head_input_norm: Optional[str] = "layer_norm",
     ):
         super().__init__()
 
@@ -136,18 +191,15 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         )
         self.value_head: Optional[nn.Module] = None
         if add_value_head:
-            # The head is randomly initialized and optimized separately from
-            # the policy.  Keeping its two small tensors in FP32 avoids losing
-            # 1e-4-scale critic updates to the BF16 checkpoint grid.
-            self.value_head = StarVLAValueHead(hidden_size, 1, dtype=torch.float32)
-            if value_head_zero_init:
-                # Sparse binary returns start near zero. A randomly initialized
-                # linear head on Qwen3-VL hidden states predicts values of
-                # magnitude ~10, which makes the first dozens of GAE updates
-                # fit noise and dominates a model-wide gradient clip.
-                nn.init.zeros_(self.value_head.weight)
-                if self.value_head.bias is not None:
-                    nn.init.zeros_(self.value_head.bias)
+            # The head is optimized separately from the policy.  Keeping its
+            # two small tensors in FP32 avoids losing 1e-4-scale critic updates
+            # to the BF16 checkpoint grid; the input normalization tames the
+            # massive-activation dimensions of the VLM hidden state.
+            self.value_head = StarVLAValueHead(
+                hidden_size,
+                input_norm=value_head_input_norm,
+                zero_init=value_head_zero_init,
+            )
 
         self.q_head: Optional[nn.Module] = None
         if add_q_head:
