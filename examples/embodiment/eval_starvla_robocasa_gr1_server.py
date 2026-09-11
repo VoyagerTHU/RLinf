@@ -99,24 +99,24 @@ def remove_training_only_value_head(
 ) -> dict[str, torch.Tensor]:
     """Remove PPO/SAC critic tensors before deterministic policy evaluation.
 
-    The value head is trained and checkpointed with the PPO actor, but it is
-    not used to choose actions.  The official-compatible evaluator therefore
-    builds the inference policy without that head.  Removing only the exact
-    wrapper-side value-head keys keeps strict loading enabled for every tensor
-    that can affect actions.
+    The value head (PPO) and twin Q heads (SAC) are trained and checkpointed
+    with the actor, but neither is used to choose actions.  The
+    official-compatible evaluator therefore builds the inference policy without
+    them.  Matching whole critic subtrees by prefix keeps strict loading enabled
+    for every tensor that can affect actions while staying robust to the head's
+    internal layout (``value_head.weight`` for a bare linear head,
+    ``value_head.proj.weight`` once the head normalizes its input).
     """
-    training_only_keys = {
-        "value_head.weight",
-        "value_head.bias",
-        "model.value_head.weight",
-        "model.value_head.bias",
-    }
+    critic_prefixes = (
+        "value_head.",
+        "model.value_head.",
+        "q_head.",
+        "model.q_head.",
+    )
     return {
         key: value
         for key, value in state_dict.items()
-        if key not in training_only_keys
-        and not key.startswith("q_head.")
-        and not key.startswith("model.q_head.")
+        if not key.startswith(critic_prefixes)
     }
 
 
