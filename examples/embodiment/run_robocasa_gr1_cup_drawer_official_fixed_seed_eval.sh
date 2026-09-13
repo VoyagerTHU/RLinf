@@ -11,9 +11,12 @@ BASE_CHECKPOINT=${BASE_CHECKPOINT:-/data/dengyixuan/wyz/models/StarVLA/Qwen3-VL-
 CHECKPOINT=${1:?Usage: $0 FULL_WEIGHTS_CHECKPOINT [RUN_ROOT]}
 RUN_ROOT=${2:-/data/dengyixuan/wyz/experiments/rlinf_starvla_robocasa_gr1_step10_official_fixed50_eval_$(date +%Y%m%d_%H%M%S)}
 SEED_MANIFEST=${SEED_MANIFEST:-/data/dengyixuan/wyz/experiments/starvla_robocasa_gr1/seeds_24x50_base20260819.json}
-REFERENCE_RESULT=${REFERENCE_RESULT:-/data/dengyixuan/wyz/experiments/starvla_robocasa_gr1/oft_steps90000_fixed_seed_base20260819/results_merged/PnPCupToDrawerClose_GR1ArmsAndWaistFourierHands_Env.json}
-TASK_NAME=gr1_unified/PnPCupToDrawerClose_GR1ArmsAndWaistFourierHands_Env
+# Any of the 24 gr1_unified tasks in the seed manifest; the base-checkpoint
+# reference result is looked up per task unless REFERENCE_RESULT is given.
+TASK_NAME=${TASK_NAME:-gr1_unified/PnPCupToDrawerClose_GR1ArmsAndWaistFourierHands_Env}
 TASK_SLUG=${TASK_NAME#*/}
+REFERENCE_ROOT=${REFERENCE_ROOT:-/data/dengyixuan/wyz/experiments/starvla_robocasa_gr1/oft_steps90000_fixed_seed_base20260819/results_merged}
+REFERENCE_RESULT=${REFERENCE_RESULT:-${REFERENCE_ROOT}/${TASK_SLUG}.json}
 NUM_SHARDS=${NUM_SHARDS:-8}
 GPU_IDS=${GPU_IDS:-}
 ENSEMBLE_CHECKPOINT_B=${ENSEMBLE_CHECKPOINT_B:-}

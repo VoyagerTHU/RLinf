@@ -305,6 +305,25 @@ actor losses, and it fails fast if ``actor.model.sac_task_description`` differs
 from the instruction the environment emits, because replayed forwards rebuild
 the prompt from that string.
 
+``robocasa_gr1_24task_ppo_starvla.yaml`` trains one policy on all 24
+``gr1_unified`` tabletop tasks with the same PPO recipe. Multi-task support
+lives entirely in the environment, as in RLinf's LIBERO-130 recipe: the env
+config lists ``task_names`` (``env/robocasa_gr1_24task.yaml``), every global
+seed group ``g`` is owned by task ``g % num_tasks`` so each simulator
+subprocess keeps one task for the whole run, and each task walks its own seed
+ring from a ``{"tasks": {...}}`` manifest
+(``seeds/robocasa_gr1_24task_train_500.json``; the evaluation manifest is the
+official 24 x 50 fixed-seed list). The policy is conditioned only through the
+per-environment instruction in ``task_descriptions``; because prompts are
+padded to ``actor.model.rollout_prompt_seq_len`` for tensor stacking, that
+value must cover the longest instruction (192 for this suite). Evaluation
+covers ``eval_seed_count`` seeds per task over several ordered rounds when
+there are fewer environments than seeds; ``algorithm.eval_rollout_epoch`` must
+equal the required round count, which ``validate_embodied_cfg`` checks. The
+environment reports ``sample_task`` per trajectory, the rollout tables carry
+the task name per row, and the runner logs ``env/task/<task>/success_once``
+and ``eval/task/<task>/success_once`` next to the aggregate metrics.
+
 Grouped GRPO requires ``env`` and ``actor`` to have the same world size (or at
 least that every trajectory piece an actor rank receives holds whole seed
 groups): environment workers split their rollouts across actor ranks by batch

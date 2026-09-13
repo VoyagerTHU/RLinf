@@ -793,6 +793,42 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
+def _validate_robocasa_gr1_multitask_eval(cfg) -> None:
+    """Check that a multi-task RoboCasa GR1 evaluation visits every seed once.
+
+    Each simulator keeps one task, so ``eval_seed_count`` seeds per task are
+    covered over ``ceil(eval_seed_count / envs_per_task)`` ordered rounds. The
+    env walks those rounds across ``algorithm.eval_rollout_epoch`` epochs and
+    wraps, so the two must agree or an evaluation silently repeats or skips
+    seeds.
+    """
+    env_cfg = cfg.env.eval
+    if env_cfg.get("env_type", None) != "robocasa_gr1":
+        return
+    task_names = env_cfg.get("task_names", None)
+    if not task_names or len(task_names) <= 1:
+        return
+    from rlinf.envs.robocasa_gr1.seed_pool import eval_rounds_required
+
+    num_tasks = len(task_names)
+    group_size = int(env_cfg.get("group_size", 1))
+    global_groups = int(env_cfg.total_num_envs) // group_size
+    assert global_groups >= num_tasks, (
+        f"env.eval.total_num_envs={env_cfg.total_num_envs} gives {global_groups} "
+        f"seed groups, fewer than the {num_tasks} evaluation tasks"
+    )
+    eval_seed_count = env_cfg.get("eval_seed_count", None)
+    assert eval_seed_count is not None, (
+        "Multi-task robocasa_gr1 evaluation requires env.eval.eval_seed_count"
+    )
+    required = eval_rounds_required(num_tasks, global_groups, int(eval_seed_count))
+    assert int(cfg.algorithm.eval_rollout_epoch) == required, (
+        f"algorithm.eval_rollout_epoch={cfg.algorithm.eval_rollout_epoch} but a "
+        f"{num_tasks}-task evaluation with {global_groups} envs and "
+        f"eval_seed_count={eval_seed_count} needs exactly {required} rounds"
+    )
+
+
 def validate_embodied_cfg(cfg):
     model_type = SupportedModel(cfg.actor.model.model_type)
     assert model_type in EMBODIED_MODEL, (
@@ -832,6 +868,7 @@ def validate_embodied_cfg(cfg):
         assert cfg.env.eval.total_num_envs // env_world_size // stage_num > 0, (
             "env.eval.total_num_envs // env_world_size // rollout.pipeline_stage_num must be greater than 0"
         )
+        _validate_robocasa_gr1_multitask_eval(cfg)
         assert (
             cfg.env.eval.total_num_envs
             // env_world_size

@@ -55,7 +55,9 @@ class EmbodiedRunner:
         "sample_seed",
         "sample_group",
         "sample_trajectory",
+        "sample_task",
     }
+
     def __init__(
         self,
         cfg: DictConfig,
@@ -186,8 +188,10 @@ class EmbodiedRunner:
             step=self.global_step if step is None else step,
             mode="eval",
         )
+        per_task_metrics = self._per_task_metrics(eval_metrics_list, mode="eval")
         eval_metrics_list = self._without_rollout_identity(eval_metrics_list)
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
+        eval_metrics.update(per_task_metrics)
         return eval_metrics
 
     def _without_rollout_identity(self, metrics_list: list[dict]) -> list[dict]:
@@ -199,6 +203,42 @@ class EmbodiedRunner:
             }
             for metrics in metrics_list
         ]
+
+    def _env_task_names(self, mode: str) -> list[str]:
+        """Ordered task list of the train or eval environment config."""
+        env_cfg = self.cfg.env.eval if mode == "eval" else self.cfg.env.train
+        task_names = env_cfg.get("task_names", None)
+        if task_names:
+            return [str(name) for name in task_names]
+        task_name = env_cfg.get("task_name", None)
+        return [str(task_name)] if task_name is not None else []
+
+    def _per_task_metrics(self, metrics_list: list[dict], *, mode: str) -> dict:
+        """Success rate and episode count per task, keyed ``task/<name>/...``.
+
+        Only produced when the environment reports ``sample_task`` and more
+        than one task is configured; single-task runs keep their flat metrics.
+        """
+        task_ids = self._metric_values(metrics_list, "sample_task")
+        task_names = self._env_task_names(mode)
+        if not task_ids or len(task_names) <= 1:
+            return {}
+        successes = self._metric_values(metrics_list, "success_once")
+        if len(successes) != len(task_ids):
+            raise RuntimeError(
+                f"Mismatched {mode} per-task metric lengths: "
+                f"{len(successes)} successes vs {len(task_ids)} task ids"
+            )
+        outcomes: dict[int, list[float]] = defaultdict(list)
+        for task_id, success in zip(task_ids, successes):
+            outcomes[int(task_id)].append(float(success))
+        metrics = {}
+        for task_id in sorted(outcomes):
+            name = task_names[task_id].split("/")[-1]
+            values = outcomes[task_id]
+            metrics[f"task/{name}/success_once"] = sum(values) / len(values)
+            metrics[f"task/{name}/episodes"] = float(len(values))
+        return metrics
 
     @staticmethod
     def _metric_values(metrics_list: list[dict], key: str) -> list:
@@ -232,9 +272,7 @@ class EmbodiedRunner:
         grasped = self._metric_values(metrics_list, "grasped_once")
         in_drawer = self._metric_values(metrics_list, "obj_in_drawer_once")
         grasp_steps = self._metric_values(metrics_list, "grasp_first_step")
-        drawer_steps = self._metric_values(
-            metrics_list, "obj_in_drawer_first_step"
-        )
+        drawer_steps = self._metric_values(metrics_list, "obj_in_drawer_first_step")
         success_steps = self._metric_values(metrics_list, "success_first_step")
         episode_lengths = self._metric_values(metrics_list, "episode_len")
         returns = self._metric_values(metrics_list, "return")
@@ -284,11 +322,13 @@ class EmbodiedRunner:
         grasp_rate_by_seed = rates_by_seed(grasped) if grasped else {}
         drawer_rate_by_seed = rates_by_seed(in_drawer) if in_drawer else {}
 
-        task_name = str(
-            self.cfg.env.eval.task_name
-            if mode == "eval"
-            else self.cfg.env.train.task_name
-        )
+        task_names = self._env_task_names(mode)
+        task_ids = self._metric_values(metrics_list, "sample_task")
+        if task_ids and len(task_ids) != trajectory_count:
+            raise RuntimeError(
+                f"Mismatched {mode} rollout table sample_task field length: "
+                f"{len(task_ids)} != {trajectory_count}"
+            )
         rows = []
         for row_index, (
             seed,
@@ -311,7 +351,11 @@ class EmbodiedRunner:
                 {
                     "training_step": int(step),
                     "mode": mode,
-                    "task": task_name,
+                    "task": (
+                        task_names[int(task_ids[row_index])]
+                        if task_ids
+                        else (task_names[0] if task_names else "")
+                    ),
                     "seed": int(seed),
                     "group_index": int(group),
                     "trajectory_index": int(trajectory),
@@ -579,12 +623,11 @@ class EmbodiedRunner:
             env_results_list = [
                 results for results in env_results if results is not None
             ]
-            self._log_seed_rollout_table(
-                env_results_list, step=_step, mode="train"
-            )
+            self._log_seed_rollout_table(env_results_list, step=_step, mode="train")
             env_metrics = compute_evaluate_metrics(
                 self._without_rollout_identity(env_results_list)
             )
+            env_metrics.update(self._per_task_metrics(env_results_list, mode="train"))
             env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
             ranked_env_results = [
                 {"rank": rank, "env": rank_metrics}

@@ -1,3 +1,17 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """RLinf environment adapter for the official RoboCasa GR1 tabletop tasks."""
 
 from __future__ import annotations
@@ -11,8 +25,9 @@ import torch
 
 from rlinf.envs.robocasa.venv import RobocasaSubprocEnv
 from rlinf.envs.robocasa_gr1.seed_pool import (
+    eval_rounds_required,
     load_task_seeds,
-    select_process_seed_groups,
+    select_multitask_process_seed_groups,
 )
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
 
@@ -86,10 +101,16 @@ def drawer_progress_potential(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute per-environment drawer-task milestone potentials."""
     grasped = np.asarray(
-        [bool(info.get("subtask_signals", {}).get("grasp_object", 0)) for info in info_lists]
+        [
+            bool(info.get("subtask_signals", {}).get("grasp_object", 0))
+            for info in info_lists
+        ]
     )
     in_drawer = np.asarray(
-        [bool(info.get("subtask_signals", {}).get("obj_in_drawer", 0)) for info in info_lists]
+        [
+            bool(info.get("subtask_signals", {}).get("obj_in_drawer", 0))
+            for info in info_lists
+        ]
     )
     potential = np.zeros(len(info_lists), dtype=np.float32)
     potential[grasped] = float(grasp_reward)
@@ -98,8 +119,30 @@ def drawer_progress_potential(
     return potential, grasped, in_drawer
 
 
+def resolve_task_names(cfg) -> list[str]:
+    """Return the ordered task list from ``task_names`` or the single ``task_name``.
+
+    Every task is a registered ``gr1_unified/...`` Gym id. The list is
+    order-sensitive: task index ``t`` owns every global seed group ``g`` with
+    ``g % num_tasks == t`` and is reported as ``sample_task == t``.
+    """
+    task_names = cfg.get("task_names", None)
+    if task_names is None or len(task_names) == 0:
+        return [str(cfg.task_name)]
+    if isinstance(task_names, str):
+        task_names = [task_names]
+    names = [str(name) for name in task_names]
+    if len(set(names)) != len(names):
+        raise ValueError(f"task_names contains duplicates: {names}")
+    return names
+
+
 class RoboCasaGR1Env(gym.Env):
-    """Vectorized GR1 tabletop task with true grouped-seed GRPO semantics."""
+    """Vectorized GR1 tabletop tasks with true grouped-seed GRPO semantics.
+
+    One or many tasks: each simulator subprocess is built for one task and
+    keeps it for the whole run; seeds are drawn per task from the manifest.
+    """
 
     metadata = {"render_fps": 20}
     _IMAGE_KEY = "video.ego_view_bg_crop_pad_res256_freq20"
@@ -123,7 +166,11 @@ class RoboCasaGR1Env(gym.Env):
                 f"num_envs={self.num_envs} must be divisible by group_size={self.group_size}"
             )
         self.num_group = self.num_envs // self.group_size
-        self.task_name = str(cfg.task_name)
+        self.task_names = resolve_task_names(cfg)
+        self.num_tasks = len(self.task_names)
+        # Kept for single-task callers and logging; multi-task code must use
+        # ``task_names[env_task_ids[i]]``.
+        self.task_name = self.task_names[0]
         self.seed = int(cfg.seed) + self.seed_offset
         self.auto_reset = bool(cfg.auto_reset)
         self.ignore_terminations = bool(cfg.ignore_terminations)
@@ -148,11 +195,25 @@ class RoboCasaGR1Env(gym.Env):
         self._is_start = True
         self._selection_round = 0
 
-        self.seed_pool = load_task_seeds(
-            cfg.seed_manifest,
-            self.task_name,
-            expected_size=cfg.get("seed_pool_size", None),
-        )
+        self.seed_pools = [
+            load_task_seeds(
+                cfg.seed_manifest,
+                task_name,
+                expected_size=cfg.get("seed_pool_size", None),
+            )
+            for task_name in self.task_names
+        ]
+        self.env_task_ids: Optional[np.ndarray] = None
+        self.eval_rounds = 1
+        if bool(cfg.get("is_eval", False)):
+            valid_seed_count = cfg.get("eval_seed_count", None)
+            if valid_seed_count is None:
+                valid_seed_count = min(len(pool) for pool in self.seed_pools)
+            self.eval_rounds = eval_rounds_required(
+                self.num_tasks,
+                self.num_group * self.total_num_processes,
+                int(valid_seed_count),
+            )
         self._assign_seed_groups()
         self.env = RobocasaSubprocEnv(self._get_env_fns())
 
@@ -162,9 +223,7 @@ class RoboCasaGR1Env(gym.Env):
         self.grasped_once = np.zeros(self.num_envs, dtype=bool)
         self.obj_in_drawer_once = np.zeros(self.num_envs, dtype=bool)
         self.grasp_first_step = np.full(self.num_envs, -1, dtype=np.int32)
-        self.obj_in_drawer_first_step = np.full(
-            self.num_envs, -1, dtype=np.int32
-        )
+        self.obj_in_drawer_first_step = np.full(self.num_envs, -1, dtype=np.int32)
         self.success_first_step = np.full(self.num_envs, -1, dtype=np.int32)
         self.returns = np.zeros(self.num_envs, dtype=np.float32)
         self.current_raw_obs = None
@@ -187,16 +246,25 @@ class RoboCasaGR1Env(gym.Env):
 
     def _assign_seed_groups(self) -> None:
         is_eval = bool(self.cfg.get("is_eval", False))
-        group_seeds, group_valid, global_group_ids = select_process_seed_groups(
-            self.seed_pool,
-            groups_per_process=self.num_group,
-            process_index=self.seed_offset,
-            total_processes=self.total_num_processes,
-            selection_round=self._selection_round,
-            sampler_seed=int(self.cfg.get("seed_sampler_seed", self.cfg.seed)),
-            shuffle=not is_eval,
-            valid_seed_count=self.cfg.get("eval_seed_count", None),
+        group_task_ids, group_seeds, group_valid, global_group_ids = (
+            select_multitask_process_seed_groups(
+                self.seed_pools,
+                groups_per_process=self.num_group,
+                process_index=self.seed_offset,
+                total_processes=self.total_num_processes,
+                selection_round=self._selection_round,
+                sampler_seed=int(self.cfg.get("seed_sampler_seed", self.cfg.seed)),
+                shuffle=not is_eval,
+                valid_seed_count=self.cfg.get("eval_seed_count", None),
+            )
         )
+        env_task_ids = np.repeat(group_task_ids, self.group_size)
+        if self.env_task_ids is None:
+            self.env_task_ids = env_task_ids
+        elif not np.array_equal(self.env_task_ids, env_task_ids):
+            # Subprocesses are built once per task; the assignment must not
+            # drift between rollout rounds.
+            raise RuntimeError("RoboCasa GR1 task assignment changed between rounds")
         self.group_seeds = group_seeds
         self.env_seeds = np.repeat(group_seeds, self.group_size)
         self.metric_valid = np.repeat(group_valid, self.group_size)
@@ -204,7 +272,12 @@ class RoboCasaGR1Env(gym.Env):
         self.trajectory_ids = np.tile(np.arange(self.group_size), self.num_group)
 
     def update_reset_state_ids(self):
-        if not bool(self.cfg.get("is_eval", False)):
+        if bool(self.cfg.get("is_eval", False)):
+            # Ordered evaluation walks each task's seed prefix over
+            # ``eval_rounds`` rounds (one per eval_rollout_epoch) and wraps, so
+            # every evaluation call visits the same seeds in the same order.
+            self._selection_round = (self._selection_round + 1) % self.eval_rounds
+        else:
             self._selection_round += 1
         self._assign_seed_groups()
 
@@ -220,9 +293,9 @@ class RoboCasaGR1Env(gym.Env):
 
     def _get_env_fns(self):
         env_fns = []
-        renderer_backend = str(
-            self.cfg.get("renderer_backend", "nvidia")
-        ).strip().lower()
+        renderer_backend = (
+            str(self.cfg.get("renderer_backend", "nvidia")).strip().lower()
+        )
         if renderer_backend == "nvidia":
             configured_device = self.cfg.get("egl_device", None)
             if configured_device is None:
@@ -240,10 +313,10 @@ class RoboCasaGR1Env(gym.Env):
                 f"{renderer_backend!r}"
             )
         llvmpipe_threads = self.cfg.get("llvmpipe_threads", None)
-        for _ in range(self.num_envs):
+        for env_id in range(self.num_envs):
 
             def env_fn(
-                task_name=self.task_name,
+                task_name=self.task_names[int(self.env_task_ids[env_id])],
                 backend=renderer_backend,
                 device_id=renderer_device,
                 software_threads=llvmpipe_threads,
@@ -254,21 +327,19 @@ class RoboCasaGR1Env(gym.Env):
                     configure_simulator_egl(device_id)
                 else:
                     configure_simulator_mesa(device_id, software_threads)
-                import robocasa  # noqa: F401 - registers GR1 Gym environments
-                import robocasa.utils.gym_utils.gymnasium_groot  # noqa: F401
-
                 # RoboSuite repeats expected GR1 controller-component warnings
                 # at every seeded scene reset. Keep errors visible without
                 # flooding Ray's driver stream or duplicating root-log output.
                 import logging
 
+                import robocasa  # noqa: F401 - registers GR1 Gym environments
+                import robocasa.utils.gym_utils.gymnasium_groot  # noqa: F401
+
                 robosuite_logger = logging.getLogger("robosuite_logs")
                 robosuite_logger.setLevel(logging.ERROR)
                 robosuite_logger.propagate = False
                 return RoboCasaSubtaskSignalWrapper(
-                    gym.make(
-                        task_name, enable_render=True, disable_env_checker=True
-                    )
+                    gym.make(task_name, enable_render=True, disable_env_checker=True)
                 )
 
             env_fns.append(env_fn)
@@ -351,9 +422,7 @@ class RoboCasaGR1Env(gym.Env):
             # remains boolean for reward and termination bookkeeping.
             "success_once": self.success_once.astype(np.float32, copy=True),
             "grasped_once": self.grasped_once.astype(np.float32, copy=True),
-            "obj_in_drawer_once": self.obj_in_drawer_once.astype(
-                np.float32, copy=True
-            ),
+            "obj_in_drawer_once": self.obj_in_drawer_once.astype(np.float32, copy=True),
             "grasp_first_step": self.grasp_first_step.copy(),
             "obj_in_drawer_first_step": self.obj_in_drawer_first_step.copy(),
             "success_first_step": self.success_first_step.copy(),
@@ -361,6 +430,7 @@ class RoboCasaGR1Env(gym.Env):
             "episode_len": self.elapsed_steps.copy(),
             "reward": self.returns / np.maximum(self.elapsed_steps, 1),
             "sample_seed": self.env_seeds.copy(),
+            "sample_task": self.env_task_ids.copy(),
             "sample_group": self.global_group_ids.copy(),
             "sample_trajectory": self.trajectory_ids.copy(),
             "metric_valid": self.metric_valid.copy(),

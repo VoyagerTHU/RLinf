@@ -1,0 +1,65 @@
+env_type: robocasa_gr1
+# All 24 gr1_unified tabletop tasks of the StarVLA RoboCasa-GR1 suite, in the
+# official evaluation order. Task index t owns every global seed group g with
+# g % 24 == t; each simulator subprocess keeps its task for the whole run.
+task_names:
+  - gr1_unified/PnPCupToDrawerClose_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PnPPotatoToMicrowaveClose_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PnPMilkToMicrowaveClose_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PnPBottleToCabinetClose_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PnPWineToCabinetClose_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PnPCanToDrawerClose_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromCuttingboardToBasketSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromCuttingboardToCardboardboxSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromCuttingboardToPanSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromCuttingboardToPotSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromCuttingboardToTieredbasketSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromPlacematToBasketSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromPlacematToBowlSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromPlacematToPlateSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromPlacematToTieredshelfSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromPlateToBowlSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromPlateToCardboardboxSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromPlateToPanSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromPlateToPlateSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromTrayToCardboardboxSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromTrayToPlateSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromTrayToPotSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromTrayToTieredbasketSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromTrayToTieredshelfSplitA_GR1ArmsAndWaistFourierHands_Env
+# First task; kept for single-task code paths and log labels.
+task_name: gr1_unified/PnPCupToDrawerClose_GR1ArmsAndWaistFourierHands_Env
+
+total_num_envs: null
+group_size: 1
+auto_reset: false
+ignore_terminations: false
+max_episode_steps: 960
+max_steps_per_rollout_epoch: 720
+use_rel_reward: true
+reward_coef: 1.0
+is_eval: false
+
+seed: 20260820
+seed_sampler_seed: 20260820
+seed_manifest: null
+seed_pool_size: null
+eval_seed_count: null
+# null selects the physical GPU assigned to each EnvWorker by RLinf.
+egl_device: null
+# ``nvidia`` is fast but does not reproduce the pixels used by StarVLA's
+# published evaluation. ``mesa`` selects its llvmpipe EGL device instead.
+renderer_backend: nvidia
+mesa_egl_device: 8
+llvmpipe_threads: null
+
+video_cfg:
+  save_video: true
+  info_on_video: true
+  fps: 20
+  extra_info_on_video:
+    - episode.success_once
+    - episode.sample_seed
+    - episode.sample_group
+    - episode.sample_trajectory
+  video_base_dir: ${runner.logger.log_path}/video/train
