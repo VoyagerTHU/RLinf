@@ -1,0 +1,51 @@
+env_type: robocasa_gr1
+# Eight-task training subset of the 24-task RoboCasa-GR1 suite. One anchor
+# (cup->drawer), and per task family one task that single-task RL on
+# cup->drawer hurt and one it helped, plus the hardest novel task; the other
+# 16 tasks stay held out for transfer evaluation. Task index t owns every
+# global seed group g with g % 8 == t.
+task_names:
+  - gr1_unified/PnPCupToDrawerClose_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PnPCanToDrawerClose_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PnPMilkToMicrowaveClose_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PnPBottleToCabinetClose_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromCuttingboardToTieredbasketSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromCuttingboardToPotSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromPlacematToBasketSplitA_GR1ArmsAndWaistFourierHands_Env
+  - gr1_unified/PosttrainPnPNovelFromTrayToTieredshelfSplitA_GR1ArmsAndWaistFourierHands_Env
+# First task; kept for single-task code paths and log labels.
+task_name: gr1_unified/PnPCupToDrawerClose_GR1ArmsAndWaistFourierHands_Env
+
+total_num_envs: null
+group_size: 1
+auto_reset: false
+ignore_terminations: false
+max_episode_steps: 960
+max_steps_per_rollout_epoch: 720
+use_rel_reward: true
+reward_coef: 1.0
+is_eval: false
+
+seed: 20260820
+seed_sampler_seed: 20260820
+seed_manifest: null
+seed_pool_size: null
+eval_seed_count: null
+# null selects the physical GPU assigned to each EnvWorker by RLinf.
+egl_device: null
+# ``nvidia`` is fast but does not reproduce the pixels used by StarVLA's
+# published evaluation. ``mesa`` selects its llvmpipe EGL device instead.
+renderer_backend: nvidia
+mesa_egl_device: 8
+llvmpipe_threads: null
+
+video_cfg:
+  save_video: true
+  info_on_video: true
+  fps: 20
+  extra_info_on_video:
+    - episode.success_once
+    - episode.sample_seed
+    - episode.sample_group
+    - episode.sample_trajectory
+  video_base_dir: ${runner.logger.log_path}/video/train
