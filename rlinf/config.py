@@ -793,6 +793,44 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
+_ON_POLICY_EMBODIED_LOSSES = ("actor", "actor_critic", "decoupled_actor_critic")
+
+
+def _validate_actor_batch_divides_rollout(
+    cfg, *, actor_world_size: int, chunk_steps_per_epoch: int
+) -> None:
+    """Fail at startup if the per-rank rollout cannot be cut into equal batches.
+
+    ``EmbodiedFSDPActor.run_training`` asserts that every rank's rollout
+    (``envs_per_rank * rollout_epoch * chunk_steps``) is a multiple of
+    ``global_batch_size / actor_world_size``. That assertion fires only after
+    the first rollout, so an off-by-config here used to cost a full rollout
+    (over an hour for 48 RoboCasa envs) before failing.
+    """
+    if cfg.algorithm.get("loss_type", None) not in _ON_POLICY_EMBODIED_LOSSES:
+        return
+    actor_world_size = int(actor_world_size)
+    total_samples = (
+        int(cfg.env.train.total_num_envs)
+        * int(cfg.algorithm.rollout_epoch)
+        * int(chunk_steps_per_epoch)
+    )
+    assert total_samples % actor_world_size == 0, (
+        f"{total_samples} rollout samples cannot be split over {actor_world_size} "
+        "actor ranks"
+    )
+    per_rank = total_samples // actor_world_size
+    batch_per_rank = int(cfg.actor.global_batch_size) // actor_world_size
+    assert per_rank % batch_per_rank == 0, (
+        f"Each actor rank receives {per_rank} rollout samples "
+        f"(env.train.total_num_envs={cfg.env.train.total_num_envs} x "
+        f"algorithm.rollout_epoch={cfg.algorithm.rollout_epoch} x "
+        f"{chunk_steps_per_epoch} chunks / {actor_world_size} ranks), which is not "
+        f"a multiple of actor.global_batch_size / actor_world_size = {batch_per_rank}; "
+        "pick a global_batch_size whose per-rank share divides the rollout"
+    )
+
+
 def _validate_robocasa_gr1_multitask_eval(cfg) -> None:
     """Check that a multi-task RoboCasa GR1 evaluation visits every seed once.
 
@@ -931,6 +969,12 @@ def validate_embodied_cfg(cfg):
         assert cfg.env.train.max_steps_per_rollout_epoch % train_action_steps == 0, (
             "env.train.max_steps_per_rollout_epoch must be divisible by the "
             f"executed action horizon ({train_action_steps})"
+        )
+        _validate_actor_batch_divides_rollout(
+            cfg,
+            actor_world_size=component_placement.get_world_size("actor"),
+            chunk_steps_per_epoch=cfg.env.train.max_steps_per_rollout_epoch
+            // train_action_steps,
         )
 
     with open_dict(cfg):

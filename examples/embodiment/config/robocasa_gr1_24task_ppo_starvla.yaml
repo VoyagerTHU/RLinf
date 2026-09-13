@@ -187,7 +187,10 @@ actor:
   # PPO: OFT head + FP32 value head are trainable; the BF16 backbone is frozen.
   trainable_parameter_prefixes: [starvla_model.action_model, value_head]
   micro_batch_size: 4
-  global_batch_size: 512
+  # MT: each actor rank holds 12 envs x 4 rollout epochs x 60 chunks = 2880
+  # samples per update; 768 / 4 ranks = 192 per optimizer step divides that
+  # exactly and keeps 15 optimizer steps per update, as in the single-task run.
+  global_batch_size: 768
   seed: 42
   enable_offload: false
   model:
