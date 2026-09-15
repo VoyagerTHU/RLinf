@@ -271,6 +271,11 @@ adapters and the complete action head; Qwen base weights and a fixed
 ``actor_logstd`` remain frozen. For sparse patch synchronization, select the
 action-head prefix together with the ``.lora_A.`` and ``.lora_B.`` name
 fragments so resumed rollout workers receive both trained components.
+With ``actor.trainable_parameter_prefixes`` in use, add
+``actor.trainable_parameter_substrings: [.lora_A., .lora_B.]`` so the
+whitelist keeps the adapters trainable; the adapters then form their own
+optimizer group with ``optim.lora_lr`` and ``optim.lora_clip_grad``
+(defaulting to ``optim.lr`` / ``optim.clip_grad``).
 
 The GR1 policy executes ``12 x 29 = 348`` Gaussian action dimensions per
 chunk with ``sigma = exp(-3.5)``, so a chunk-level likelihood ratio sums 348

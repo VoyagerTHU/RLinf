@@ -1003,7 +1003,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.cfg.actor.get("combine_reference_model", True)
         )
         if self.kl_beta < 0:
-            raise ValueError(f"algorithm.kl_beta must be non-negative, got {self.kl_beta}.")
+            raise ValueError(
+                f"algorithm.kl_beta must be non-negative, got {self.kl_beta}."
+            )
         if self.kl_beta > 0 and not self.combine_reference_model:
             raise NotImplementedError(
                 "EmbodiedFSDPActor currently requires actor.combine_reference_model=true "
@@ -1104,6 +1106,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             model = super().model_provider_func()
 
         trainable_prefixes = self.cfg.actor.get("trainable_parameter_prefixes", None)
+        # Name fragments (e.g. ".lora_A.", ".lora_B.") select parameters that a
+        # prefix cannot isolate, such as PEFT adapters spread across the backbone.
+        trainable_substrings = self.cfg.actor.get(
+            "trainable_parameter_substrings", None
+        )
+        if trainable_substrings and not trainable_prefixes:
+            raise ValueError(
+                "actor.trainable_parameter_substrings requires "
+                "actor.trainable_parameter_prefixes as well"
+            )
         if trainable_prefixes:
             if not self.cfg.actor.fsdp_config.get("use_orig_params", False):
                 raise ValueError(
@@ -1122,6 +1134,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 raise ValueError(
                     "actor.trainable_parameter_prefixes must contain a non-empty prefix"
                 )
+            if isinstance(trainable_substrings, str):
+                trainable_substrings = [trainable_substrings]
+            substrings = tuple(
+                str(fragment)
+                for fragment in (trainable_substrings or [])
+                if str(fragment)
+            )
 
             total_parameters = sum(param.numel() for param in model.parameters())
             trainable_parameters = 0
@@ -1130,7 +1149,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 is_trainable = any(
                     name == prefix or name.startswith(f"{prefix}.")
                     for prefix in prefixes
-                )
+                ) or any(fragment in name for fragment in substrings)
                 param.requires_grad_(is_trainable)
                 if is_trainable:
                     trainable_parameters += param.numel()
@@ -1141,9 +1160,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     f"{list(prefixes)}"
                 )
             self._logger.info(
-                "[FSDP] Parameter whitelist enabled: prefixes=%s, "
+                "[FSDP] Parameter whitelist enabled: prefixes=%s, substrings=%s, "
                 "trainable=%d/%d (%.4f%%), tensors=%d",
                 list(prefixes),
+                list(substrings),
                 trainable_parameters,
                 total_parameters,
                 100.0 * trainable_parameters / total_parameters,

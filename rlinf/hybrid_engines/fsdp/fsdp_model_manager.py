@@ -48,6 +48,21 @@ warnings.filterwarnings(
 )
 
 
+def classify_optimizer_param_group(name: str) -> str:
+    """Route a trainable parameter to the ``actor``, ``critic`` or ``lora`` group.
+
+    The critic (value head) keeps its own learning rate and clip budget; PEFT
+    adapters (``.lora_A.`` / ``.lora_B.``) get ``optim.lora_lr`` and
+    ``optim.lora_clip_grad`` so a backbone adapter can move faster than a
+    pretrained action head trained at ``optim.lr``.
+    """
+    if "value_head" in name or "model.value_head" in name:
+        return "critic"
+    if ".lora_A." in name or ".lora_B." in name:
+        return "lora"
+    return "actor"
+
+
 class FSDPModelManager:
     """
     FSDP Model Manager for RL training
@@ -493,6 +508,7 @@ class FSDPModelManager:
         default_max_norm = float(self._cfg.optim.clip_grad)
         max_norms = {
             "actor": default_max_norm,
+            "lora": float(self._cfg.optim.get("lora_clip_grad", default_max_norm)),
             "critic": float(self._cfg.optim.get("value_clip_grad", default_max_norm)),
         }
         self.last_grad_norms = clip_grad_norm_per_group_(
@@ -561,13 +577,15 @@ class FSDPModelManager:
 
         params_actor = []
         params_critic = []
+        params_lora = []
+        groups = {"actor": params_actor, "critic": params_critic, "lora": params_lora}
 
         if enable_critic_warmup:
             self._logger.info("[FSDP] Enable critic warmup for value head.")
             for name, param in model.named_parameters():
                 if param.requires_grad:
                     self.store_requires_grad_param_name.append(name)
-                    if "value_head" in name or "model.value_head" in name:
+                    if classify_optimizer_param_group(name) == "critic":
                         params_critic.append(param)
                         continue
                     param.requires_grad = False
@@ -577,10 +595,7 @@ class FSDPModelManager:
                 if name in self.store_requires_grad_param_name:
                     param.requires_grad = True
                 if param.requires_grad:
-                    if "value_head" in name or "model.value_head" in name:
-                        params_critic.append(param)
-                    else:
-                        params_actor.append(param)
+                    groups[classify_optimizer_param_group(name)].append(param)
 
         param_groups = []
         if len(params_actor) > 0:
@@ -589,6 +604,17 @@ class FSDPModelManager:
                     "name": "actor",
                     "params": params_actor,
                     "lr": self._cfg.optim.lr,
+                    "betas": betas,
+                }
+            )
+        if len(params_lora) > 0:
+            # PEFT adapters start at zero output and usually want a larger
+            # step than a pretrained head; default to the actor lr.
+            param_groups.append(
+                {
+                    "name": "lora",
+                    "params": params_lora,
+                    "lr": self._cfg.optim.get("lora_lr", self._cfg.optim.lr),
                     "betas": betas,
                 }
             )

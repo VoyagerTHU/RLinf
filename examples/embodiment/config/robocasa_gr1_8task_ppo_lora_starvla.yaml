@@ -1,0 +1,293 @@
+defaults:
+  - env/robocasa_gr1_8task@env.train
+  - env/robocasa_gr1_8task@env.eval
+  - model/starvla@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+# Multi-task PPO on the 8-task subset with Qwen3-VL LoRA adapters trained
+# alongside the OFT head ("LoRA:" marks the differences from
+# robocasa_gr1_8task_ppo_starvla.yaml). Motivation: with only the shared OFT
+# head trainable, RL learns a near task-agnostic action offset (the single-task
+# cup->drawer head shifts microwave-task actions by the same 0.2 sigma in the
+# same direction), so tasks compete instead of specializing. Backbone adapters
+# let the action-token features adapt per instruction.
+# Base recipe:
+# robocasa_gr1_cup_drawer_ppo_starvla.yaml (lines marked "PPO:"), with the
+# multi-task differences marked "MT:".
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,rollout: ${oc.env:ROBOCASA_GR1_ACTOR_ROLLOUT_PLACEMENT,4-7}
+    env: ${oc.env:ROBOCASA_GR1_ENV_PLACEMENT,4-7}
+
+runner:
+  task_type: embodied
+  weight_sync_interval: 1
+  logger:
+    log_path: ${oc.env:ROBOCASA_GR1_PPO_LOG_ROOT,/data/dengyixuan/wyz/experiments/rlinf_starvla_robocasa_gr1_8task_ppo_lora}
+    project_name: rlinf-starvla-robocasa-gr1
+    experiment_name: gr1_8task_ppo_lora_r32_gae_valuehead_tokenlevel
+    logger_backends: []
+  max_epochs: 100
+  max_steps: -1
+  only_eval: false
+  # MT: an 8-task evaluation is 96 episodes in one Mesa round (~10 min).
+  val_check_interval: 5
+  save_interval: 5
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  normalize_advantages: true
+  positive_advantages_only: false
+  prioritize_positive_advantage_samples: false
+  kl_penalty: low_var_kl
+  # PPO: no seed groups are needed; every env samples its own seed.
+  group_size: 1
+  reward_coef: 1.0
+  rollout_epoch: 4
+  # MT: 96 eval envs / 8 tasks = 12 slots per task = eval_seed_count -> 1 round.
+  # Must equal ceil(eval_seed_count / (eval envs / 8)); validated in config.py.
+  eval_rollout_epoch: 1
+  reward_type: chunk_level
+  logprob_type: token_level
+  entropy_type: token_level
+  update_epoch: 1
+  # PPO: GAE over the 60 executed chunks per episode (gamma per chunk).
+  adv_type: gae
+  loss_type: actor_critic
+  loss_agg_func: token-mean
+  kl_beta: 0.001
+  kl_beta_min: 1.0e-4
+  kl_beta_max: 1.0
+  kl_beta_adapt_factor: 2.0
+  reference_forward_micro_batch_size: 4
+  entropy_bonus: 0.0
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  target_kl: 0.02
+  reference_target_kl: 0.05
+  max_optimizer_steps_per_update: null
+  recompute_rollout_logprobs_on_actor: true
+  actor_logprob_recompute_micro_batch_size: 4
+  audit_post_update_logprobs: true
+  post_update_logprob_audit_micro_batch_size: 4
+  # PPO: value targets live in [0, 1] once the head is zero-initialized.
+  value_clip: 0.2
+  huber_delta: 10.0
+  gamma: 0.99
+  gae_lambda: 0.95
+  filter_rewards: false
+  rewards_lower_bound: 0.1
+  rewards_upper_bound: 0.9
+  sampling_params:
+    do_sample: true
+    temperature_train: 1.0
+    temperature_eval: 1.0
+    top_k: 0
+    top_p: 1.0
+    repetition_penalty: 1.0
+    add_BOS: false
+  length_params:
+    max_new_token: 256
+    max_length: 1024
+    min_length: 1
+
+env:
+  group_name: EnvGroup
+  enable_offload: false
+  train:
+    # MT: 48 envs = 6 per task per rollout epoch (12 per GPU); 192 trajectories
+    # per step, 24 per task.
+    total_num_envs: 48
+    group_size: ${algorithm.group_size}
+    seed_manifest: ${oc.env:REPO_PATH}/examples/embodiment/config/seeds/robocasa_gr1_24task_train_500.json
+    seed_pool_size: 500
+    seed_sampler_seed: 20260820
+    reward_coef: ${algorithm.reward_coef}
+    subtask_reward_shaping:
+      enabled: false
+      grasp_object: 0.1
+      obj_in_drawer: 0.5
+      success: 1.0
+    renderer_backend: nvidia
+    llvmpipe_threads: null
+    action_steps_per_chunk: 12
+    max_episode_steps: 720
+    video_cfg:
+      save_video: true
+      info_on_video: true
+      fps: 20
+      extra_info_on_video:
+        - episode.success_once
+        - episode.grasped_once
+        - episode.obj_in_drawer_once
+        - episode.grasp_first_step
+        - episode.obj_in_drawer_first_step
+        - episode.success_first_step
+        - episode.sample_task
+        - episode.sample_seed
+        - episode.sample_group
+        - episode.sample_trajectory
+      video_base_dir: ${runner.logger.log_path}/video/train
+  eval:
+    # MT: 96 Mesa envs = 12 per task; the first 12 of each task's 50 official
+    # seeds per evaluation.
+    total_num_envs: 96
+    group_size: 1
+    is_eval: true
+    seed_manifest: ${oc.env:REPO_PATH}/examples/embodiment/config/seeds/robocasa_gr1_24task_eval_50.json
+    seed_pool_size: 50
+    eval_seed_count: 12
+    action_steps_per_chunk: 12
+    max_episode_steps: 720
+    renderer_backend: mesa
+    mesa_egl_device: 8
+    llvmpipe_threads: 1
+    video_cfg:
+      save_video: true
+      info_on_video: true
+      fps: 20
+      extra_info_on_video:
+        - episode.success_once
+        - episode.sample_task
+        - episode.sample_seed
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: RolloutGroup
+  generation_backend: huggingface
+  training_sampling_seed: 20260821
+  recompute_logprobs: false
+  unnorm_key: ${actor.model.unnorm_key}
+  enable_offload: false
+  pipeline_stage_num: 1
+  inference_micro_batch_size: 8
+  # PPO: rollout-time values are needed for GAE and truncation bootstraps.
+  collect_prev_infos: true
+  model:
+    model_path: ${actor.model.model_path}
+    precision: ${actor.model.precision}
+
+weight_syncer:
+  patch:
+    init_sync:
+      enabled: true
+      # PPO: the value head is trained too; bootstrap it into the rollout copy.
+      prefixes: [starvla_model.action_model, value_head, actor_logstd]
+      # LoRA: adapters live throughout the Qwen3-VL subtree; select them by name.
+      name_substrings: [.lora_A., .lora_B.]
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  # PPO: OFT head + FP32 value head are trainable; the BF16 backbone stays frozen
+  # except for the LoRA adapters selected by name below.
+  trainable_parameter_prefixes: [starvla_model.action_model, value_head]
+  # LoRA: keep the PEFT adapters trainable under the whitelist.
+  trainable_parameter_substrings: [.lora_A., .lora_B.]
+  micro_batch_size: 4
+  # MT: each actor rank holds 12 envs x 4 rollout epochs x 60 chunks = 2880
+  # samples per update; 768 / 4 ranks = 192 per optimizer step divides that
+  # exactly and keeps 15 optimizer steps per update, as in the single-task run.
+  global_batch_size: 768
+  seed: 42
+  enable_offload: false
+  model:
+    model_path: /data/dengyixuan/wyz/models/StarVLA/Qwen3-VL-OFT-Robocasa/checkpoints/steps_90000_pytorch_model.pt
+    model_type: starvla
+    precision: bf16
+    action_model_precision: fp32
+    action_dim: 29
+    num_action_chunks: 16
+    num_executed_action_chunks: 12
+    # MT: prompts are padded to a fixed length so trajectory tensors stack.
+    # 155 fits the cup->drawer instruction exactly; the novel pick-and-place
+    # tasks ("pick the X from the Y and place it on the level #N of the Z")
+    # need more, and any overflow raises at rollout time.
+    rollout_prompt_seq_len: 192
+    num_steps: 16
+    policy_setup: gr1
+    unnorm_key: gr1
+    action_stats_source: minmax
+    # PPO: linear FP32 critic on the last Qwen3-VL hidden state. Zero
+    # initialization starts values at 0 (the sparse-return prior) instead of
+    # the +-10 a random head produces on these hidden states.
+    # LoRA: rank-32 adapters on every linear layer of the Qwen3-VL subtree
+    # (vision + language). Adapters start at zero output, so step 0 equals the
+    # base policy and the reference-KL leash measures drift from it.
+    is_lora: true
+    lora_scope: qwen3_vl
+    lora_rank: 32
+    lora_target_modules: all-linear
+    lora_train_action_head: true
+    add_value_head: true
+    value_head_zero_init: true
+    # PPO: normalize the critic input. The raw Qwen3-VL last-layer hidden
+    # state has massive-activation dimensions; a bare linear head on it saw
+    # pre-clip gradient norms of 1e3-6e3, bootstrapped returns swinging to
+    # negative means, and explained variance < 0 for 20 updates.
+    value_head_input_norm: layer_norm
+    initial_logstd: -3.5
+    trainable_logstd: false
+    use_proprio: false
+    starvla:
+      ckpt_path: ${actor.model.model_path}
+      framework_name: QwenOFT
+      expected_action_dim: ${actor.model.action_dim}
+      expected_num_action_chunks: ${actor.model.num_action_chunks}
+      expected_image_size: [224, 224]
+      enable_state_input: false
+  optim:
+    lr: 1.0e-6
+    # LoRA: adapters are zero-initialized and need a larger step than the
+    # pretrained head; the reference-KL leash bounds the resulting drift.
+    lora_lr: 1.0e-5
+    lora_clip_grad: 2.0
+    value_lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-5
+    weight_decay: 0.01
+    # PPO: clip the actor and critic parameter groups separately. A single
+    # model-wide clip let the critic's gradient (norm ~1e4 at the start of the
+    # previous run) scale the actor gradient by ~1e-4 and freeze the policy.
+    clip_grad: 2.0
+    value_clip_grad: 10.0
+    clip_grad_per_group: true
+    # PPO: critic-only warmup for the first two rollouts (15 optimizer steps
+    # each). "soft" keeps the optimizer fixed and drops actor gradients, which
+    # is safe under FSDP1 + use_orig_params; the policy loss, reference KL
+    # and entropy terms are zero during warmup.
+    critic_warmup_steps: 30
+    critic_warmup_mode: soft
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: full_shard
+    use_orig_params: true
+    gradient_checkpointing: false
+    mixed_precision:
+      param_dtype: null
+      reduce_dtype: null
+      buffer_dtype: null
+    # PPO: both trainable heads are separate FSDP units with uniform dtypes.
+    wrap_policy:
+      module_classes_to_wrap: [L1RegressionActionHead, StarVLAValueHead]
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false
