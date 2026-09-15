@@ -24,6 +24,12 @@ import numpy as np
 import torch
 
 from rlinf.envs.robocasa.venv import RobocasaSubprocEnv
+from rlinf.envs.robocasa_gr1.progress import (
+    compute_progress_stages,
+    drawer_progress_potential,
+    potential_shaping_reward,
+    task_general_progress_potential,
+)
 from rlinf.envs.robocasa_gr1.seed_pool import (
     eval_rounds_required,
     load_task_seeds,
@@ -71,52 +77,28 @@ def configure_simulator_mesa(
 class RoboCasaSubtaskSignalWrapper(gym.Wrapper):
     """Expose task-provided progress signals without changing task success."""
 
-    def _subtask_signals(self) -> dict[str, int]:
+    def _progress_info(self) -> dict[str, dict]:
         task_env = getattr(self.env.unwrapped, "env", None)
         signal_fn = getattr(task_env, "get_subtask_term_signals", None)
-        if signal_fn is None:
-            return {}
-        return {key: int(value) for key, value in signal_fn().items()}
+        signals = (
+            {} if signal_fn is None else {k: int(v) for k, v in signal_fn().items()}
+        )
+        return {
+            "subtask_signals": signals,
+            "progress_stages": compute_progress_stages(task_env),
+        }
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         info = dict(info)
-        info["subtask_signals"] = self._subtask_signals()
+        info.update(self._progress_info())
         return obs, info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         info = dict(info)
-        info["subtask_signals"] = self._subtask_signals()
+        info.update(self._progress_info())
         return obs, reward, terminated, truncated, info
-
-
-def drawer_progress_potential(
-    info_lists: list[dict],
-    terminations: np.ndarray,
-    *,
-    grasp_reward: float,
-    in_drawer_reward: float,
-    success_reward: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute per-environment drawer-task milestone potentials."""
-    grasped = np.asarray(
-        [
-            bool(info.get("subtask_signals", {}).get("grasp_object", 0))
-            for info in info_lists
-        ]
-    )
-    in_drawer = np.asarray(
-        [
-            bool(info.get("subtask_signals", {}).get("obj_in_drawer", 0))
-            for info in info_lists
-        ]
-    )
-    potential = np.zeros(len(info_lists), dtype=np.float32)
-    potential[grasped] = float(grasp_reward)
-    potential[in_drawer] = float(in_drawer_reward)
-    potential[np.asarray(terminations, dtype=bool)] = float(success_reward)
-    return potential, grasped, in_drawer
 
 
 def resolve_task_names(cfg) -> list[str]:
@@ -187,6 +169,31 @@ class RoboCasaGR1Env(gym.Env):
                 "RoboCasa GR1 subtask rewards must satisfy "
                 "0 <= grasp_object <= obj_in_drawer <= success"
             )
+        self.shaping_mode = str(shaping_cfg.get("mode", "drawer")).strip().lower()
+        if self.shaping_mode not in ("drawer", "task_general"):
+            raise ValueError(
+                "subtask_reward_shaping.mode must be 'drawer' or 'task_general', "
+                f"got {self.shaping_mode!r}"
+            )
+        self.stage_rewards = {
+            "grasped": float(shaping_cfg.get("grasped", 0.2)),
+            "placed": float(shaping_cfg.get("placed", 0.5)),
+            "released": float(shaping_cfg.get("released", 0.7)),
+        }
+        if not (
+            0.0
+            <= self.stage_rewards["grasped"]
+            <= self.stage_rewards["placed"]
+            <= self.stage_rewards["released"]
+            <= self.success_reward
+        ):
+            raise ValueError(
+                "RoboCasa GR1 task-general stage rewards must satisfy "
+                "0 <= grasped <= placed <= released <= success"
+            )
+        self.shaping_coef = float(shaping_cfg.get("coef", 1.0))
+        if self.shaping_coef < 0.0:
+            raise ValueError("subtask_reward_shaping.coef must be non-negative")
         self.action_steps_per_chunk = cfg.get("action_steps_per_chunk", None)
         if self.action_steps_per_chunk is not None:
             self.action_steps_per_chunk = int(self.action_steps_per_chunk)
@@ -218,12 +225,17 @@ class RoboCasaGR1Env(gym.Env):
         self.env = RobocasaSubprocEnv(self._get_env_fns())
 
         self.prev_step_reward = np.zeros(self.num_envs, dtype=np.float32)
+        self.prev_potential = np.zeros(self.num_envs, dtype=np.float32)
         self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
         self.success_once = np.zeros(self.num_envs, dtype=bool)
         self.grasped_once = np.zeros(self.num_envs, dtype=bool)
         self.obj_in_drawer_once = np.zeros(self.num_envs, dtype=bool)
         self.grasp_first_step = np.full(self.num_envs, -1, dtype=np.int32)
         self.obj_in_drawer_first_step = np.full(self.num_envs, -1, dtype=np.int32)
+        self.placed_once = np.zeros(self.num_envs, dtype=bool)
+        self.released_once = np.zeros(self.num_envs, dtype=bool)
+        self.placed_first_step = np.full(self.num_envs, -1, dtype=np.int32)
+        self.released_first_step = np.full(self.num_envs, -1, dtype=np.int32)
         self.success_first_step = np.full(self.num_envs, -1, dtype=np.int32)
         self.returns = np.zeros(self.num_envs, dtype=np.float32)
         self.current_raw_obs = None
@@ -377,12 +389,17 @@ class RoboCasaGR1Env(gym.Env):
 
     def _reset_metrics(self, env_idx: np.ndarray) -> None:
         self.prev_step_reward[env_idx] = 0.0
+        self.prev_potential[env_idx] = 0.0
         self._elapsed_steps[env_idx] = 0
         self.success_once[env_idx] = False
         self.grasped_once[env_idx] = False
         self.obj_in_drawer_once[env_idx] = False
+        self.placed_once[env_idx] = False
+        self.released_once[env_idx] = False
         self.grasp_first_step[env_idx] = -1
         self.obj_in_drawer_first_step[env_idx] = -1
+        self.placed_first_step[env_idx] = -1
+        self.released_first_step[env_idx] = -1
         self.success_first_step[env_idx] = -1
         self.returns[env_idx] = 0.0
 
@@ -425,6 +442,10 @@ class RoboCasaGR1Env(gym.Env):
             "obj_in_drawer_once": self.obj_in_drawer_once.astype(np.float32, copy=True),
             "grasp_first_step": self.grasp_first_step.copy(),
             "obj_in_drawer_first_step": self.obj_in_drawer_first_step.copy(),
+            "placed_once": self.placed_once.astype(np.float32, copy=True),
+            "released_once": self.released_once.astype(np.float32, copy=True),
+            "placed_first_step": self.placed_first_step.copy(),
+            "released_first_step": self.released_first_step.copy(),
             "success_first_step": self.success_first_step.copy(),
             "return": self.returns.copy(),
             "episode_len": self.elapsed_steps.copy(),
@@ -438,31 +459,64 @@ class RoboCasaGR1Env(gym.Env):
         infos["episode"] = to_tensor(episode_info)
         return infos
 
-    def _calc_step_reward(self, terminations, info_lists):
-        progress_reward, grasped, in_drawer = drawer_progress_potential(
+    def _calc_step_reward(self, terminations, truncations, info_lists):
+        drawer_potential, drawer_grasped, in_drawer = drawer_progress_potential(
             info_lists,
             terminations,
             grasp_reward=self.grasp_reward,
             in_drawer_reward=self.in_drawer_reward,
             success_reward=self.success_reward,
         )
-        first_grasp = grasped & (~self.grasped_once)
-        first_in_drawer = in_drawer & (~self.obj_in_drawer_once)
-        self.grasp_first_step[first_grasp] = self.elapsed_steps[first_grasp]
-        self.obj_in_drawer_first_step[first_in_drawer] = self.elapsed_steps[
-            first_in_drawer
-        ]
+        general_potential, stages = task_general_progress_potential(
+            info_lists,
+            terminations,
+            stage_rewards=self.stage_rewards,
+            success_reward=self.success_reward,
+        )
+        # The drawer signals exist only for the drawer family; the generic
+        # stages exist for every task, so grasp bookkeeping takes either.
+        grasped = drawer_grasped | stages["grasped"]
+        released = stages["placed"] & stages["released"]
+        for reached, reached_once, first_step in (
+            (grasped, self.grasped_once, self.grasp_first_step),
+            (in_drawer, self.obj_in_drawer_once, self.obj_in_drawer_first_step),
+            (stages["placed"], self.placed_once, self.placed_first_step),
+            (released, self.released_once, self.released_first_step),
+        ):
+            first = reached & (~reached_once)
+            first_step[first] = self.elapsed_steps[first]
         self.grasped_once |= grasped
         self.obj_in_drawer_once |= in_drawer
+        self.placed_once |= stages["placed"]
+        self.released_once |= released
 
-        if self.subtask_reward_shaping:
-            reward = progress_reward
-            reward = np.maximum(reward, self.prev_step_reward)
-        else:
-            reward = np.asarray(terminations, dtype=np.float32)
-        reward_diff = reward - self.prev_step_reward
-        self.prev_step_reward = reward
-        return reward_diff if self.use_rel_reward else reward
+        # Task reward: unchanged binary success, in the relative form the
+        # recipes use (+1 on the step success first fires, -1 if it is undone).
+        task_level = np.asarray(terminations, dtype=np.float32)
+        task_reward = task_level - self.prev_step_reward
+        self.prev_step_reward = task_level
+        if not self.use_rel_reward:
+            task_reward = task_level
+        if not self.subtask_reward_shaping:
+            return task_reward
+
+        # Potential-based shaping, added rather than substituted, with the
+        # potential forced to zero at the episode boundary. The shaping terms
+        # then telescope to -Phi(s_0) = 0 over an episode, so every episode's
+        # undiscounted return is exactly the binary one and the optimal policy
+        # is unchanged (Ng et al., 1999); only the temporal distribution of
+        # credit changes. Substituting the potential instead would pay a
+        # "placed but never closed" rollout more than some tasks' success rate.
+        potential = (
+            drawer_potential if self.shaping_mode == "drawer" else general_potential
+        )
+        shaping_reward, self.prev_potential = potential_shaping_reward(
+            potential,
+            self.prev_potential,
+            episode_over=truncations,
+            coef=self.shaping_coef,
+        )
+        return task_reward + shaping_reward
 
     def step(self, actions=None, auto_reset=True):
         if actions is None:
@@ -486,7 +540,7 @@ class RoboCasaGR1Env(gym.Env):
             [bool(info.get("success", False)) for info in info_lists], dtype=bool
         )
         truncations = self._elapsed_steps >= int(self.cfg.max_episode_steps)
-        step_reward = self._calc_step_reward(terminations, info_lists)
+        step_reward = self._calc_step_reward(terminations, truncations, info_lists)
         obs = self._wrap_obs(raw_obs)
         infos = list_of_dict_to_dict_of_list(list(info_lists))
         infos = self._record_metrics(step_reward, terminations, infos)

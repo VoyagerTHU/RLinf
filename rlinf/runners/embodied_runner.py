@@ -207,10 +207,12 @@ class EmbodiedRunner:
     def _env_task_names(self, mode: str) -> list[str]:
         """Ordered task list of the train or eval environment config."""
         env_cfg = self.cfg.env.eval if mode == "eval" else self.cfg.env.train
-        task_names = env_cfg.get("task_names", None)
+        # getattr rather than .get: the env config is a DictConfig in a real
+        # run but a plain namespace in the runner unit tests.
+        task_names = getattr(env_cfg, "task_names", None)
         if task_names:
             return [str(name) for name in task_names]
-        task_name = env_cfg.get("task_name", None)
+        task_name = getattr(env_cfg, "task_name", None)
         return [str(task_name)] if task_name is not None else []
 
     def _per_task_metrics(self, metrics_list: list[dict], *, mode: str) -> dict:

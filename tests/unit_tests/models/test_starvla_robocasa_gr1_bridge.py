@@ -81,9 +81,10 @@ def test_remove_training_only_value_head_preserves_policy_tensors():
     result = remove_training_only_value_head(state_dict)
 
     assert set(result) == {"starvla_model.action_model.weight"}
-    assert result["starvla_model.action_model.weight"] is state_dict[
-        "starvla_model.action_model.weight"
-    ]
+    assert (
+        result["starvla_model.action_model.weight"]
+        is state_dict["starvla_model.action_model.weight"]
+    )
 
 
 def test_starvla_ppo_value_head_stays_fp32_with_bf16_policy():
@@ -101,8 +102,7 @@ def test_starvla_ppo_value_head_stays_fp32_with_bf16_policy():
             return_value={},
         ),
         patch(
-            "rlinf.models.embodiment.starvla.starvla_action_model."
-            "infer_policy_profile",
+            "rlinf.models.embodiment.starvla.starvla_action_model.infer_policy_profile",
             return_value={
                 "action_head_type": "oft",
                 "state_adapter_type": None,
@@ -110,8 +110,7 @@ def test_starvla_ppo_value_head_stays_fp32_with_bf16_policy():
             },
         ),
         patch(
-            "rlinf.models.embodiment.starvla.starvla_action_model."
-            "infer_hidden_size",
+            "rlinf.models.embodiment.starvla.starvla_action_model.infer_hidden_size",
             return_value=4,
         ),
     ):
@@ -123,7 +122,9 @@ def test_starvla_ppo_value_head_stays_fp32_with_bf16_policy():
             unnorm_key="gr1",
         )
 
-    assert policy.value_head.weight.dtype == torch.float32
+    # The head normalizes its input, so the trained tensors live under .proj.
+    assert policy.value_head.proj.weight.dtype == torch.float32
+    assert policy.value_head.proj.bias.dtype == torch.float32
     assert policy.starvla_model.action_model.weight.dtype == torch.bfloat16
 
 
@@ -269,9 +270,7 @@ def test_gr1_unnormalization_keeps_seventh_channel_continuous():
 def test_gr1_torch_unnormalization_matches_numpy_and_keeps_gradient():
     import torch
 
-    normalized = torch.linspace(-0.75, 0.75, 58, dtype=torch.float32).reshape(
-        1, 2, 29
-    )
+    normalized = torch.linspace(-0.75, 0.75, 58, dtype=torch.float32).reshape(1, 2, 29)
     normalized.requires_grad_(True)
     stats = {
         "q01": np.linspace(-2.0, -1.0, 29, dtype=np.float64),
@@ -279,16 +278,12 @@ def test_gr1_torch_unnormalization_matches_numpy_and_keeps_gradient():
         "mask": np.ones(29, dtype=bool),
     }
 
-    result = unnormalize_actions_for_env_torch(
-        normalized, stats, policy_setup="gr1"
-    )
+    result = unnormalize_actions_for_env_torch(normalized, stats, policy_setup="gr1")
     expected = unnormalize_actions_for_env(
         normalized.detach().numpy(), stats, policy_setup="gr1"
     )
 
-    np.testing.assert_allclose(
-        result.detach().numpy(), expected, rtol=1e-6, atol=3e-7
-    )
+    np.testing.assert_allclose(result.detach().numpy(), expected, rtol=1e-6, atol=3e-7)
     result.sum().backward()
     assert normalized.grad is not None
     assert torch.isfinite(normalized.grad).all()
@@ -315,8 +310,7 @@ def test_starvla_sac_q_heads_start_at_zero():
     }
     with (
         patch(
-            "rlinf.models.embodiment.starvla.starvla_action_model."
-            "infer_policy_profile",
+            "rlinf.models.embodiment.starvla.starvla_action_model.infer_policy_profile",
             return_value=profile,
         ),
         patch(
@@ -325,8 +319,7 @@ def test_starvla_sac_q_heads_start_at_zero():
             return_value=stats,
         ),
         patch(
-            "rlinf.models.embodiment.starvla.starvla_action_model."
-            "infer_hidden_size",
+            "rlinf.models.embodiment.starvla.starvla_action_model.infer_hidden_size",
             return_value=4,
         ),
     ):

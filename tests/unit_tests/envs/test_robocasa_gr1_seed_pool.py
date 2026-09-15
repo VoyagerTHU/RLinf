@@ -128,7 +128,8 @@ def test_restoring_selection_round_skips_completed_rollout_epochs():
             "seed": 20260820,
         }
     )
-    env.seed_pool = list(range(1, 501))
+    env.seed_pools = [list(range(1, 501))]
+    env.env_task_ids = None
     env.num_group = 2
     env.seed_offset = 0
     env.total_num_processes = 8
@@ -142,7 +143,7 @@ def test_restoring_selection_round_skips_completed_rollout_epochs():
     assert env._selection_round == 8
     assert not np.array_equal(env.group_seeds, initial_seeds)
     expected, _, _ = select_process_seed_groups(
-        env.seed_pool,
+        env.seed_pools[0],
         groups_per_process=2,
         process_index=0,
         total_processes=8,

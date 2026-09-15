@@ -329,6 +329,31 @@ environment reports ``sample_task`` per trajectory, the rollout tables carry
 the task name per row, and the runner logs ``env/task/<task>/success_once``
 and ``eval/task/<task>/success_once`` next to the aggregate metrics.
 
+Binary task success delivers roughly one reward per 1200 control steps on this
+suite, which is the main obstacle to credit assignment (it is also why the SAC
+recipe's critic never became informative). ``env.train.subtask_reward_shaping``
+adds a milestone potential on top of that reward. ``mode: task_general`` scores
+the milestones every ``gr1_unified`` task shares, grasping the object, placing
+it into its target, and releasing it, where the target is a drawer, microwave
+or cabinet fixture for the "Close" families and a container on the table for
+the novel families. Every stage predicate is simulator state that the task
+itself uses inside ``_check_success``, so there is nothing learned for a policy
+to exploit, and ``released`` only pays once ``placed`` holds so an untouched
+object at reset scores zero. ``mode: drawer`` keeps the older hand-written
+drawer-only potential.
+
+The potential is added as ``Phi(s') - Phi(s)`` and forced to zero on the step an
+episode ends, so the shaping terms telescope to ``-Phi(s_0) = 0``: every
+episode's undiscounted return stays exactly the binary one and the optimal
+policy is unchanged (Ng et al., 1999), while credit arrives when the milestone
+is reached rather than only at the end. Substituting the potential for the task
+reward instead would pay a rollout that places the object but never closes the
+door more than some tasks' success rate is worth, which does change the
+objective. ``coef`` scales the shaping term; evaluation environments leave
+shaping off so reported success is unaffected. The environment also reports
+``placed_once`` / ``released_once`` and their first-reach steps alongside the
+older drawer-specific metrics.
+
 Grouped GRPO requires ``env`` and ``actor`` to have the same world size (or at
 least that every trajectory piece an actor rank receives holds whole seed
 groups): environment workers split their rollouts across actor ranks by batch
