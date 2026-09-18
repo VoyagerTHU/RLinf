@@ -231,6 +231,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             )
         else:
             auto_save_path = os.path.join(auto_save_path, f"rank_{self._rank}")
+        # Minimum batch-wise standard deviation of Q before the actor is
+        # allowed to train. 0 disables the gate and reproduces the old
+        # behaviour.
+        self.min_q_std_for_actor = float(
+            self.cfg.algorithm.get("min_q_std_for_actor", 0.0)
+        )
         self.replay_buffer = TrajectoryReplayBuffer(
             seed=seed,
             enable_cache=self.cfg.algorithm.replay_buffer.enable_cache,
@@ -543,7 +549,16 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             all_data_q_values - target_q_values.expand_as(all_data_q_values)
         ).square()
         critic_loss = masked_transition_mean(squared_error, transition_valid)
-        metrics = {"q_data": all_data_q_values.mean().item()}
+        # Spread of Q across the batch. dQ/da can only steer the actor when the
+        # critic actually discriminates between states and actions; a critic
+        # that has collapsed to a constant (q_data ~ 0.011 for every sample in
+        # the sparse-reward run) hands the actor pure noise.
+        metrics = {
+            "q_data": all_data_q_values.mean().item(),
+            "q_data_std": all_data_q_values.float().std(dim=0).mean().item()
+            if all_data_q_values.shape[0] > 1
+            else 0.0,
+        }
         if transition_valid is not None:
             metrics["transition_valid_fraction"] = transition_valid.mean().item()
         return critic_loss, metrics
@@ -685,6 +700,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             "critic/grad_norm": qf_grad_norm,
             **all_critic_metrics,
         }
+
+        q_data_std = float(all_critic_metrics.get("critic/q_data_std", 0.0))
+        critic_informative = q_data_std >= self.min_q_std_for_actor
+        metrics_data["sac/q_data_std"] = q_data_std
+        metrics_data["sac/critic_informative"] = float(critic_informative)
+        train_actor = train_actor and critic_informative
+        metrics_data["sac/actor_trained"] = float(
+            train_actor and self.update_step % self.critic_actor_ratio == 0
+        )
 
         if self.update_step % self.critic_actor_ratio == 0 and train_actor:
             self.optimizer.zero_grad()

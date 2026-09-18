@@ -24,16 +24,18 @@ runner:
   task_type: embodied
   weight_sync_interval: 1
   logger:
-    log_path: ${oc.env:ROBOCASA_GR1_SAC_LOG_ROOT,/data/dengyixuan/wyz/experiments/rlinf_starvla_robocasa_gr1_sac}
+    log_path: ${oc.env:ROBOCASA_GR1_SAC_LOG_ROOT,/data/dengyixuan/wyz/experiments/rlinf_starvla_robocasa_gr1_sac_shaped}
     project_name: rlinf-starvla-robocasa-gr1
     experiment_name: cup_to_drawer_close_sac_actionhead_twinq
     # No remote backend; every step is persisted to metrics/*.jsonl.
     logger_backends: []
-  max_epochs: 60
-  max_steps: 60
+  max_epochs: 120
+  max_steps: 120
   only_eval: false
-  val_check_interval: -1
-  save_interval: 5
+  # Evaluate on the fixed 50 official seeds so the run is comparable with the
+  # GRPO (0.68) and PPO (0.70) results on this task.
+  val_check_interval: 5
+  save_interval: 10
   resume_dir: null
   ckpt_path: null
 
@@ -61,7 +63,12 @@ algorithm:
   # 0.99 here would become 0.886 per chunk and nearly erase a sparse terminal
   # reward across a RoboCasa episode.
   gamma: 0.999
-  tau: 0.005
+  # Value has to travel back 60 chunks to reach the start of an episode, and a
+  # target network with tau 0.005 only tracks the online critic over ~200
+  # updates, so the sparse-reward run needed ~1500 rollout steps to propagate
+  # it and collapsed at 82. Milestone shaping (below) removes most of that
+  # distance; tau 0.02 covers the rest.
+  tau: 0.02
   target_update_freq: 1
   target_update_type: q_head_only
   lightweight_starvla_checkpoint: true
@@ -72,7 +79,15 @@ algorithm:
   q_head_type: default
   critic_subsample_size: -1
   critic_actor_ratio: 2
-  train_actor_steps: 2
+  # Rollout steps of critic-only warmup before the actor may move. The previous
+  # value of 2 let the actor follow dQ/da while Q was still a constant.
+  train_actor_steps: 15
+  # Hard gate on top of that warmup: the actor trains only while the critic
+  # discriminates, measured as the batch-wise standard deviation of Q. The
+  # collapsed run predicted ~0.011 for every sample (std ~0); with milestone
+  # rewards in [0, 1] a spread of 0.05 is a low bar that a working critic
+  # clears and a collapsed one never does.
+  min_q_std_for_actor: 0.05
   enable_drq: false
 
   entropy_tuning:
@@ -121,10 +136,21 @@ env:
     seed_pool_size: 50
     seed_sampler_seed: 20260820
     reward_coef: ${algorithm.reward_coef}
+    # The collapsed run's root cause: with binary success the critic only ever
+    # saw ~0.01 of immediate reward per chunk and had to bootstrap value back
+    # 60 chunks, which the target network could not do in the run's lifetime.
+    # Task-general milestone shaping pays each stage where it happens, so the
+    # critic has a local target everywhere. zero_potential_at_episode_end is
+    # false because a bootstrapping critic must not be taught that completed
+    # states are worth -Phi.
     subtask_reward_shaping:
-      enabled: false
-      grasp_object: 0.1
-      obj_in_drawer: 0.5
+      enabled: true
+      mode: task_general
+      coef: 1.0
+      zero_potential_at_episode_end: false
+      grasped: 0.2
+      placed: 0.5
+      released: 0.7
       success: 1.0
     renderer_backend: nvidia
     llvmpipe_threads: null

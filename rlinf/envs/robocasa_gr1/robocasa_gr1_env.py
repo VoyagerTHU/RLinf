@@ -194,6 +194,12 @@ class RoboCasaGR1Env(gym.Env):
         self.shaping_coef = float(shaping_cfg.get("coef", 1.0))
         if self.shaping_coef < 0.0:
             raise ValueError("subtask_reward_shaping.coef must be non-negative")
+        # On-policy recipes keep this true so the episodic return is unchanged;
+        # bootstrapping recipes set it false so the critic is not taught to
+        # devalue completed states. See potential_shaping_reward.
+        self.shaping_zero_at_episode_end = bool(
+            shaping_cfg.get("zero_potential_at_episode_end", True)
+        )
         self.action_steps_per_chunk = cfg.get("action_steps_per_chunk", None)
         if self.action_steps_per_chunk is not None:
             self.action_steps_per_chunk = int(self.action_steps_per_chunk)
@@ -515,6 +521,7 @@ class RoboCasaGR1Env(gym.Env):
             self.prev_potential,
             episode_over=truncations,
             coef=self.shaping_coef,
+            zero_at_episode_end=self.shaping_zero_at_episode_end,
         )
         return task_reward + shaping_reward
 

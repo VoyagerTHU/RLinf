@@ -152,18 +152,30 @@ def potential_shaping_reward(
     prev_potential: np.ndarray,
     episode_over: np.ndarray,
     coef: float = 1.0,
+    zero_at_episode_end: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Additive potential-based shaping with a zero terminal potential.
+    """Additive potential-based shaping.
 
-    Returns ``(shaping_reward, next_prev_potential)``. Forcing the potential to
-    zero on the step an episode ends makes the shaping terms telescope to
-    ``-Phi(s_0)`` over the episode, which is zero because nothing is grasped at
-    reset. The episodic (undiscounted) return therefore equals the unshaped one
-    and the optimal policy is unchanged (Ng et al., 1999); only the
-    distribution of credit across the episode changes.
+    Returns ``(shaping_reward, next_prev_potential)``.
+
+    With ``zero_at_episode_end`` the potential is forced to zero on the step an
+    episode ends, so the shaping terms telescope to ``-Phi(s_0)`` over the
+    episode, which is zero because nothing is grasped at reset. Every episode's
+    undiscounted return then equals the unshaped one and the optimal policy is
+    unchanged (Ng et al., 1999). That is what an on-policy learner wants.
+
+    A bootstrapping critic wants the opposite. Zeroing injects a large negative
+    reward on the last chunk of every episode, at states that look like "task
+    completed" and are indistinguishable from mid-episode ones without a clock,
+    so the critic learns to devalue exactly the states it most needs to value.
+    Off-policy recipes therefore set this to ``False`` and take the plain
+    potential difference, which is policy-invariant in the bootstrapped
+    (infinite-horizon) view.
     """
-    next_potential = np.where(
-        np.asarray(episode_over, dtype=bool), 0.0, potential
+    next_potential = (
+        np.where(np.asarray(episode_over, dtype=bool), 0.0, potential)
+        if zero_at_episode_end
+        else np.asarray(potential)
     ).astype(np.float32)
     return (float(coef) * (next_potential - prev_potential)).astype(
         np.float32

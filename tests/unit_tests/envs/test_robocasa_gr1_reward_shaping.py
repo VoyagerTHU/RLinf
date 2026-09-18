@@ -35,6 +35,7 @@ def _stub_env(*, shaping: bool, mode: str = "drawer"):
     env.subtask_reward_shaping = shaping
     env.shaping_mode = mode
     env.shaping_coef = 1.0
+    env.shaping_zero_at_episode_end = True
     env.grasp_reward = 0.1
     env.in_drawer_reward = 0.5
     env.success_reward = 1.0

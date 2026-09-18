@@ -159,3 +159,35 @@ def test_running_episodes_keep_their_potential() -> None:
         episode_over=np.asarray([False]),
     )
     assert np.allclose(reward, [0.3]) and np.allclose(prev, [0.5])
+
+
+def test_bootstrapping_mode_does_not_charge_back_at_the_episode_end() -> None:
+    # With zero_at_episode_end=False the last step is an ordinary transition,
+    # so a completed task is not taught to a critic as a large negative reward.
+    prev = np.zeros(1, dtype=np.float32)
+    rewards = []
+    for step, value in enumerate([0.2, 0.5, 1.0]):
+        reward, prev = progress.potential_shaping_reward(
+            np.asarray([value], dtype=np.float32),
+            prev,
+            episode_over=np.asarray([step == 2]),
+            zero_at_episode_end=False,
+        )
+        rewards.append(float(reward[0]))
+    assert np.allclose(rewards, [0.2, 0.3, 0.5])
+    assert all(r >= 0 for r in rewards)
+    assert np.allclose(prev, [1.0])
+
+
+def test_zeroing_mode_still_telescopes() -> None:
+    prev = np.zeros(1, dtype=np.float32)
+    total = 0.0
+    for step, value in enumerate([0.2, 0.5, 1.0]):
+        reward, prev = progress.potential_shaping_reward(
+            np.asarray([value], dtype=np.float32),
+            prev,
+            episode_over=np.asarray([step == 2]),
+            zero_at_episode_end=True,
+        )
+        total += float(reward[0])
+    assert abs(total) < 1e-6
