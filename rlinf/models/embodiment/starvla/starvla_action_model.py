@@ -100,7 +100,30 @@ class _RMSNorm(nn.Module):
 
 
 class StarVLAMultiQHead(MultiQHead):
-    """Twin SAC critics exposed as a distinct FSDP wrapping target."""
+    """Twin SAC critics exposed as a distinct FSDP wrapping target.
+
+    The state feature is the Qwen3-VL last-layer hidden state, which carries
+    massive-activation dimensions in the hundreds to thousands. ``QHead``
+    applies LayerNorm only after its hidden layers, so raw features let a few
+    channels dominate the first linear layer. That is the same failure that
+    held the PPO value head's explained variance below zero for twenty updates;
+    here it showed up as a critic whose batch-wise spread of Q grew a hundred
+    times too slowly to ever inform the actor. A parameter-free LayerNorm on
+    the input fixes it and adds no parameters, so checkpoints are unaffected.
+    """
+
+    def __init__(self, *args, input_norm: bool = True, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        hidden_size = kwargs.get("hidden_size", args[0] if args else None)
+        self.state_norm: nn.Module = (
+            nn.LayerNorm(int(hidden_size), eps=1e-6, elementwise_affine=False)
+            if input_norm and hidden_size
+            else nn.Identity()
+        )
+
+    def forward(self, state_features, action_features):
+        normalized = self.state_norm(state_features.float()).to(state_features.dtype)
+        return super().forward(normalized, action_features)
 
 
 class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
@@ -426,6 +449,13 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             )
         if detach_encoder:
             shared_feature = shared_feature.detach()
+        # The critic sees actions in the policy's own [-1, 1] space rather than
+        # environment units, so no channel's offset or scale dominates the
+        # fusion layer. The map is affine, so gradients to the actor survive.
+        if self._action_norm_stats is not None:
+            actions = action_space_utils.normalize_actions_from_env_torch(
+                actions, self._action_norm_stats, policy_setup=self.policy_setup
+            )
         actions = actions.reshape(actions.shape[0], -1)
         q_dtype = next(self.q_head.parameters()).dtype
         return self.q_head(shared_feature.to(dtype=q_dtype), actions.to(dtype=q_dtype))

@@ -224,6 +224,37 @@ def unnormalize_actions_for_env(
     return _gripper_mapping(env_actions, policy_setup=policy_setup)
 
 
+def normalize_actions_from_env_torch(
+    env_actions: torch.Tensor,
+    action_norm_stats: dict[str, np.ndarray],
+    policy_setup: Optional[str] = None,
+) -> torch.Tensor:
+    """Differentiable inverse of :func:`unnormalize_actions_for_env_torch`.
+
+    SAC critics take an action as input. Environment-space GR1 actions have
+    per-channel offsets up to 3.0 and scales spanning an order of magnitude, so
+    feeding them raw into an MLP lets a few channels dominate the first layer.
+    Mapping back to the policy's own [-1, 1] parameterization puts every channel
+    on the same footing without changing what the critic represents.
+    """
+    if action_norm_stats is None:
+        raise RuntimeError("Missing action_norm_stats for torch normalization")
+    resolved_platform = str(policy_setup or "").strip().lower()
+    if resolved_platform != "gr1":
+        raise NotImplementedError(
+            "Differentiable StarVLA action normalization currently supports "
+            f"only policy_setup='gr1', got {policy_setup!r}"
+        )
+    dtype = env_actions.dtype
+    device = env_actions.device
+    high = torch.as_tensor(action_norm_stats["q99"], device=device, dtype=dtype)
+    low = torch.as_tensor(action_norm_stats["q01"], device=device, dtype=dtype)
+    mask = torch.as_tensor(action_norm_stats["mask"], device=device, dtype=torch.bool)
+    span = (high - low).clamp_min(1e-8)
+    normalized = 2.0 * (env_actions - low) / span - 1.0
+    return torch.where(mask, normalized, env_actions)
+
+
 def unnormalize_actions_for_env_torch(
     normalized_actions: torch.Tensor,
     action_norm_stats: dict[str, np.ndarray],

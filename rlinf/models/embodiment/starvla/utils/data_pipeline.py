@@ -117,7 +117,10 @@ def resize_env_obs_images_cv2(
         leading_shape = array.shape[:-3]
         flat = array.reshape(-1, *array.shape[-3:])
         resized = np.stack(
-            [cv.resize(image, (width, height), interpolation=cv.INTER_AREA) for image in flat]
+            [
+                cv.resize(image, (width, height), interpolation=cv.INTER_AREA)
+                for image in flat
+            ]
         ).reshape(*leading_shape, height, width, array.shape[-1])
         resized = np.ascontiguousarray(resized)
         resized_obs[key] = torch.from_numpy(resized) if was_tensor else resized
