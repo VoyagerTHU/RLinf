@@ -72,3 +72,30 @@ def test_a_zero_coefficient_removes_the_q_term_entirely() -> None:
         _objective(pi, behaviour, torch.full((2, 1), 0.2), 0.0),
         _bc_term(pi, behaviour),
     )
+
+
+def _bc_term_as_in_worker(pi: torch.Tensor, behaviour: torch.Tensor) -> torch.Tensor:
+    """Exactly the worker's arithmetic, including the flattening."""
+    flat_behaviour = behaviour.reshape(pi.shape[0], -1)
+    delta = (pi.reshape(pi.shape[0], -1) - flat_behaviour).reshape(
+        pi.shape[0], -1, SPAN.shape[0]
+    )
+    return (2.0 * delta / SPAN).square().mean(dim=(-1, -2))
+
+
+def test_the_anchor_accepts_the_two_layouts_the_callers_use() -> None:
+    # The policy hands back [B, chunks, action_dim]; the replay buffer stores
+    # [B, chunks * action_dim]. Mixing them is what crashed attempts 2 and 5,
+    # so pin both layouts here.
+    chunked = torch.rand(4, 12, 29)
+    behaviour_flat = torch.rand(4, 12 * 29)
+    value = _bc_term_as_in_worker(chunked, behaviour_flat)
+    assert value.shape == (4,) and torch.isfinite(value).all()
+    assert torch.allclose(
+        value, _bc_term_as_in_worker(chunked, behaviour_flat.reshape(4, 12, 29))
+    )
+    assert torch.allclose(
+        _bc_term_as_in_worker(chunked, chunked.reshape(4, -1)),
+        torch.zeros(4),
+        atol=1e-7,
+    )

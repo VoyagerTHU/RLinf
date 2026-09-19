@@ -653,9 +653,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             # own normalized units so every channel counts equally. With a
             # fixed exploration sigma this is the KL to the behaviour policy up
             # to a constant factor.
-            behaviour = batch["actions"].to(pi.dtype)
+            # The policy returns [B, chunks, action_dim] while the replay
+            # buffer stores the chunk flattened, so flatten both before
+            # subtracting and only then restore the channel axis.
             span = self.action_span.to(pi.dtype)
-            delta = (pi - behaviour).reshape(pi.shape[0], -1, span.shape[0])
+            behaviour = batch["actions"].to(pi.dtype).reshape(pi.shape[0], -1)
+            delta = (pi.reshape(pi.shape[0], -1) - behaviour).reshape(
+                pi.shape[0], -1, span.shape[0]
+            )
             bc_term = (2.0 * delta / span).square().mean(dim=(-1, -2), keepdim=False)
             # TD3+BC scaling keeps the trade-off independent of the Q scale,
             # which grows over training.
