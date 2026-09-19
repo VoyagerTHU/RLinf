@@ -46,6 +46,15 @@ from rlinf.utils.utils import clear_memory
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
+def unwrap_module(model):
+    """Return the innermost module behind FSDP/DDP wrappers."""
+    seen = 0
+    while hasattr(model, "module") and seen < 8:
+        model = model.module
+        seen += 1
+    return model
+
+
 def pop_transition_valid(batch: dict) -> Optional[torch.Tensor]:
     """Remove the replay validity mask from a sampled batch and return it.
 
@@ -237,6 +246,27 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.min_q_std_for_actor = float(
             self.cfg.algorithm.get("min_q_std_for_actor", 0.0)
         )
+        # Behaviour anchor (TD3+BC). Off-policy actors drift onto actions the
+        # critic has never seen and overestimates; the 2026-09-19 run showed
+        # exactly that, with q_pi climbing 0.11 -> 0.27 while real success fell
+        # to 0.06. Pulling the policy toward the actions actually taken bounds
+        # that drift. 0 disables the term.
+        self.bc_coef = float(self.cfg.algorithm.get("bc_coef", 0.0))
+        self.action_span = None
+        if self.bc_coef > 0:
+            stats = getattr(unwrap_module(self.model), "_action_norm_stats", None)
+            if stats is None:
+                raise ValueError(
+                    "algorithm.bc_coef needs the policy's action statistics, "
+                    "which this model does not expose"
+                )
+            span = torch.as_tensor(
+                np.asarray(stats["q99"]) - np.asarray(stats["q01"]),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.action_span = span.clamp_min(1e-6)
+
         self.replay_buffer = TrajectoryReplayBuffer(
             seed=seed,
             enable_cache=self.cfg.algorithm.replay_buffer.enable_cache,
@@ -617,9 +647,23 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             qf_pi = torch.mean(all_qf_pi, dim=1, keepdim=True)
         metrics["q_pi"] = qf_pi.mean().item()
         transition_valid = batch.get(TRANSITION_VALID_KEY)
-        actor_loss = masked_transition_mean(
-            (self.entropy_temp.alpha * log_pi) - qf_pi, transition_valid
-        )
+        objective = (self.entropy_temp.alpha * log_pi) - qf_pi
+        if self.bc_coef > 0:
+            # Distance to the action actually taken, measured in the policy's
+            # own normalized units so every channel counts equally. With a
+            # fixed exploration sigma this is the KL to the behaviour policy up
+            # to a constant factor.
+            behaviour = batch["actions"].to(pi.dtype)
+            span = self.action_span.to(pi.dtype)
+            delta = (pi - behaviour).reshape(pi.shape[0], -1, span.shape[0])
+            bc_term = (2.0 * delta / span).square().mean(dim=(-1, -2), keepdim=False)
+            # TD3+BC scaling keeps the trade-off independent of the Q scale,
+            # which grows over training.
+            scale = self.bc_coef / (qf_pi.detach().abs().mean() + 1e-6)
+            objective = scale * objective + bc_term.reshape(-1, 1)
+            metrics["bc_distance"] = bc_term.mean().item()
+            metrics["bc_scale"] = scale.item()
+        actor_loss = masked_transition_mean(objective, transition_valid)
 
         entropy = -log_pi.mean()
         return actor_loss, entropy, metrics

@@ -88,6 +88,14 @@ algorithm:
   # rewards in [0, 1] a spread of 0.05 is a low bar that a working critic
   # clears and a collapsed one never does.
   min_q_std_for_actor: 0.05
+  # Behaviour anchor (TD3+BC). An informative critic was not enough: once the
+  # gate opened at step 36 the actor drove q_pi from 0.11 to 0.27 while real
+  # success fell from 0.41 to 0.06, the signature of a policy exploiting the
+  # critic's error on actions it never saw. This weights Q against the squared
+  # distance to the action actually taken, in normalized action units, and is
+  # rescaled by the running |Q| so the trade-off does not drift as Q grows.
+  # Smaller means a tighter leash; 0 disables the anchor.
+  bc_coef: 0.1
   enable_drq: false
 
   entropy_tuning:
