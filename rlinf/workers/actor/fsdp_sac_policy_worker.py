@@ -701,7 +701,22 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             **all_critic_metrics,
         }
 
+        # The actor pass runs FSDP collectives, so whether it runs has to be
+        # decided identically on every rank. Both inputs to that decision are
+        # rank-local (each rank measures Q on its own micro-batches and owns
+        # its own replay buffer), so reduce them before branching: a rank that
+        # took the branch alone would hang the others in an all-reduce.
         q_data_std = float(all_critic_metrics.get("critic/q_data_std", 0.0))
+        decision = torch.tensor(
+            [q_data_std, float(train_actor)],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if torch.distributed.is_initialized() and self._world_size > 1:
+            torch.distributed.all_reduce(decision, op=torch.distributed.ReduceOp.AVG)
+        q_data_std = float(decision[0])
+        # AVG of the per-rank booleans is 1.0 only when every rank agrees.
+        train_actor = bool(decision[1] >= 1.0)
         critic_informative = q_data_std >= self.min_q_std_for_actor
         metrics_data["sac/q_data_std"] = q_data_std
         metrics_data["sac/critic_informative"] = float(critic_informative)
