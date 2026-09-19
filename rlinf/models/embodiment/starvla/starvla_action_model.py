@@ -452,9 +452,15 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         # The critic sees actions in the policy's own [-1, 1] space rather than
         # environment units, so no channel's offset or scale dominates the
         # fusion layer. The map is affine, so gradients to the actor survive.
+        # Callers disagree on layout: the actor passes [B, chunks, action_dim]
+        # straight from the policy while the replay buffer stores the chunk
+        # already flattened, so restore the per-channel axis before applying
+        # per-channel statistics.
         if self._action_norm_stats is not None:
             actions = action_space_utils.normalize_actions_from_env_torch(
-                actions, self._action_norm_stats, policy_setup=self.policy_setup
+                actions.reshape(actions.shape[0], -1, self.action_dim),
+                self._action_norm_stats,
+                policy_setup=self.policy_setup,
             )
         actions = actions.reshape(actions.shape[0], -1)
         q_dtype = next(self.q_head.parameters()).dtype

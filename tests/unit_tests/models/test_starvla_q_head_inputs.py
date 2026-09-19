@@ -97,3 +97,20 @@ def test_environment_scale_actions_are_brought_to_unit_range() -> None:
         normalize_actions_from_env_torch(env, STATS, policy_setup="gr1").abs().max()
         <= 1.0 + 1e-5
     )
+
+
+def test_normalization_handles_the_flattened_replay_layout() -> None:
+    # The actor passes [B, chunks, action_dim]; the replay buffer stores the
+    # chunk already flattened to [B, chunks * action_dim]. sac_q_forward
+    # restores the channel axis before applying per-channel statistics, so both
+    # layouts must reach the same values.
+    generator = torch.Generator().manual_seed(3)
+    chunked = torch.rand(4, 12, 29, generator=generator) * 2 - 1
+    env = unnormalize_actions_for_env_torch(chunked, STATS, policy_setup="gr1")
+    flat = env.reshape(4, -1)
+    from_chunked = normalize_actions_from_env_torch(env, STATS, policy_setup="gr1")
+    from_flat = normalize_actions_from_env_torch(
+        flat.reshape(flat.shape[0], -1, 29), STATS, policy_setup="gr1"
+    )
+    assert torch.allclose(from_chunked, from_flat, atol=1e-6)
+    assert from_flat.reshape(4, -1).shape == (4, 348)
