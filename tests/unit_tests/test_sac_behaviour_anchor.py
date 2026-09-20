@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The SAC behaviour anchor that bounds off-policy actor drift (TD3+BC)."""
+"""The SAC behaviour anchor that bounds off-policy actor drift (TD3+BC).
+
+Since 2026-09-20 the anchor is the distance between the policy mean and the
+frozen pretrained head's mean on the same features, in normalized units. The
+earlier replay-action anchor is kept below only to pin the layouts it had to
+accept.
+"""
 
 import torch
 
@@ -98,4 +104,46 @@ def test_the_anchor_accepts_the_two_layouts_the_callers_use() -> None:
         _bc_term_as_in_worker(chunked, chunked.reshape(4, -1)),
         torch.zeros(4),
         atol=1e-7,
+    )
+
+
+SIGMA = 0.0302  # exp(-3.5)
+
+
+def _reference_anchor(mean: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    """Mirror of the worker's anchor: mean squared distance to the frozen head."""
+    return (mean - reference).square().mean(dim=(-1, -2))
+
+
+def _drift_sigma(mean: torch.Tensor, reference: torch.Tensor) -> float:
+    return (mean - reference).square().mean().sqrt().item() / SIGMA
+
+
+def test_the_reference_anchor_has_no_sampling_noise_floor() -> None:
+    # Two samples of the same policy differ by ~sqrt(2) sigma per channel and
+    # made zero drift read as 0.45-0.66 sigma; two means are exactly equal.
+    reference = torch.rand(4, 12, 29)
+    assert torch.equal(_reference_anchor(reference, reference), torch.zeros(4))
+    assert _drift_sigma(reference, reference) == 0.0
+
+
+def test_drift_is_reported_in_exploration_sigmas() -> None:
+    reference = torch.zeros(2, 12, 29)
+    shifted = torch.full((2, 12, 29), 0.5 * SIGMA)
+    assert abs(_drift_sigma(shifted, reference) - 0.5) < 1e-4
+    shifted[0, :, 0:7] = 2.0 * SIGMA  # one arm on one sample drifts more
+    per_group = (shifted - reference)[..., 0:7].square().mean().sqrt() / SIGMA
+    assert per_group > _drift_sigma(shifted, reference) > 0.5
+
+
+def test_the_reference_anchor_keeps_the_replay_anchor_units() -> None:
+    # bc_coef was tuned against mean((2 * delta_env / span)^2); in normalized
+    # units that is mean(delta_norm^2), which is what the new anchor computes,
+    # so the coefficient carries over unchanged.
+    delta_norm = torch.full((1, 12, 29), 0.1)
+    delta_env = delta_norm * SPAN / 2.0
+    assert torch.allclose(
+        _bc_term(delta_env, torch.zeros(1, 12, 29)),
+        _reference_anchor(delta_norm, torch.zeros(1, 12, 29)),
+        atol=1e-6,
     )

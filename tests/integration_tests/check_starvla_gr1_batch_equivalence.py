@@ -150,7 +150,7 @@ def main() -> None:
             )
             for result in individual
         ]
-        combined_predicted_means, combined_hidden, _ = _run_oft_backbone_and_head(
+        combined_predicted_means, combined_hidden, _, _ = _run_oft_backbone_and_head(
             policy,
             model_inputs=model_inputs(combined),
             use_cache=False,

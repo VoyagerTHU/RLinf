@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import warnings
 from functools import partial
@@ -240,6 +241,15 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
                 nn.init.zeros_(critic.net[-1].weight)
                 if critic.net[-1].bias is not None:
                     nn.init.zeros_(critic.net[-1].bias)
+            # Frozen copy of the pretrained action head. The SAC actor is
+            # anchored to this, not to the replay buffer: the buffer is a
+            # sliding window refilled by the changing policy, so an anchor to
+            # it drifts along with the policy. Constructed here, before any
+            # training, so it holds the checkpoint's weights; it lives outside
+            # the trainable prefixes and the weight syncer never touches it.
+            self.reference_action_model = copy.deepcopy(starvla_model.action_model)
+            self.reference_action_model.requires_grad_(False)
+            self.reference_action_model.eval()
         self.sac_task_description = (
             None if sac_task_description is None else str(sac_task_description).strip()
         )
@@ -394,12 +404,14 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             num_action_chunks=self.num_action_chunks,
             examples=examples,
         )
-        mean_actions, last_hidden, dist = _run_oft_backbone_and_head(
-            self,
-            model_inputs=model_inputs,
-            use_cache=False,
+        mean_actions, last_hidden, dist, action_queries = (
+            _run_oft_backbone_and_head(
+                self,
+                model_inputs=model_inputs,
+                use_cache=False,
+            )
         )
-        return mean_actions, last_hidden, dist, model_inputs
+        return mean_actions, last_hidden, dist, model_inputs, action_queries
 
     @staticmethod
     def _pool_sac_features(
@@ -414,10 +426,17 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
 
     def sac_forward(
         self, obs: dict[str, Any], mode: str = "train", **kwargs: Any
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample differentiable environment-space action chunks for SAC."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Sample differentiable environment-space action chunks for SAC.
+
+        The fourth element carries the policy's normalized mean action and the
+        frozen pretrained head's mean on the same features, so the actor can be
+        anchored to, and its drift measured against, the checkpoint itself.
+        """
         del kwargs
-        mean_actions, last_hidden, dist, model_inputs = self._run_sac_oft_policy(obs)
+        mean_actions, last_hidden, dist, model_inputs, action_queries = (
+            self._run_sac_oft_policy(obs)
+        )
         normalized_actions = mean_actions if mode == "eval" else dist.rsample()
         env_actions = action_space_utils.unnormalize_actions_for_env_torch(
             normalized_actions,
@@ -428,7 +447,20 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         features = self._pool_sac_features(
             last_hidden, model_inputs.get("attention_mask")
         )
-        return env_actions, logprobs.to(torch.float32), features
+        extras = {"mean_actions": mean_actions}
+        reference = getattr(self, "reference_action_model", None)
+        if reference is not None:
+            reference.eval()  # root .train() calls recurse into it
+            with torch.no_grad(), torch.autocast("cuda", enabled=False):
+                ref_dtype = next(
+                    (p.dtype for p in reference.parameters() if p.is_floating_point()),
+                    action_queries.dtype,
+                )
+                ref_mean = reference(action_queries.detach().to(dtype=ref_dtype))
+            extras["reference_mean_actions"] = ref_mean[
+                :, : self.num_executed_action_chunks
+            ].to(mean_actions.dtype)
+        return env_actions, logprobs.to(torch.float32), features, extras
 
     def sac_q_forward(
         self,
@@ -443,7 +475,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         if self.q_head is None:
             raise RuntimeError("StarVLA SAC_Q requires actor.model.add_q_head=true")
         if shared_feature is None:
-            _, last_hidden, _, model_inputs = self._run_sac_oft_policy(obs)
+            _, last_hidden, _, model_inputs, _ = self._run_sac_oft_policy(obs)
             shared_feature = self._pool_sac_features(
                 last_hidden, model_inputs.get("attention_mask")
             )

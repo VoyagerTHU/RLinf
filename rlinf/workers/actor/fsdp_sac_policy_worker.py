@@ -255,20 +255,44 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.action_sigma = float(
             np.exp(self.cfg.actor.model.get("initial_logstd", -2.5))
         )
-        self.action_span = None
-        if self.bc_coef > 0:
-            stats = getattr(unwrap_module(self.model), "_action_norm_stats", None)
-            if stats is None:
-                raise ValueError(
-                    "algorithm.bc_coef needs the policy's action statistics, "
-                    "which this model does not expose"
-                )
-            span = torch.as_tensor(
-                np.asarray(stats["q99"]) - np.asarray(stats["q01"]),
-                dtype=torch.float32,
-                device=self.device,
+        # Named channel groups for the drift breakdown, {name: [start, end)}
+        # over the per-step action vector. Optional; the overall drift is
+        # always reported.
+        groups = self.cfg.algorithm.get("policy_drift_groups", None) or {}
+        self.policy_drift_groups = {
+            str(name): (int(bounds[0]), int(bounds[1])) for name, bounds in groups.items()
+        }
+        # Critic action-discrimination probe. For each state the critic is
+        # evaluated on `q_action_probe_samples` actions drawn around the
+        # policy mean at `q_action_probe_sigma_scale` exploration sigmas; the
+        # spread over those actions (q_action_std) is what the actor gradient
+        # can actually use, unlike the spread over states (q_data_std), which
+        # a critic that only learned V(s) also has. 0 samples disables it.
+        self.q_action_probe_samples = int(
+            self.cfg.algorithm.get("q_action_probe_samples", 0)
+        )
+        self.q_action_probe_sigma_scale = float(
+            self.cfg.algorithm.get("q_action_probe_sigma_scale", 1.0)
+        )
+        # Optional second gate: q_action_std / q_data_std must reach this
+        # before the actor trains. 0 leaves it as a diagnostic.
+        self.min_q_action_ratio_for_actor = float(
+            self.cfg.algorithm.get("min_q_action_ratio_for_actor", 0.0)
+        )
+        # Discount rewards inside the executed chunk (sum_i gamma^i r_i) so the
+        # chunk return matches the gamma^chunk bootstrap instead of a plain sum.
+        self.discount_within_chunk = bool(
+            self.cfg.algorithm.get("discount_within_chunk", False)
+        )
+        self._action_norm_stats = getattr(
+            unwrap_module(self.model), "_action_norm_stats", None
+        )
+        self._policy_setup = getattr(unwrap_module(self.model), "policy_setup", None)
+        if self.q_action_probe_samples > 0 and self._action_norm_stats is None:
+            raise ValueError(
+                "algorithm.q_action_probe_samples needs the policy's action "
+                "statistics, which this model does not expose"
             )
-            self.action_span = span.clamp_min(1e-6)
 
         self.replay_buffer = TrajectoryReplayBuffer(
             seed=seed,
@@ -437,6 +461,78 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             if len(intervene_traj_list) > 0:
                 self.demo_buffer.add_trajectories(intervene_traj_list)
 
+    def _policy_forward(self, obs, **kwargs):
+        """Run the SAC policy; models may return a fourth ``extras`` dict.
+
+        StarVLA returns the policy's normalized mean action and the frozen
+        pretrained head's mean on the same features there; other policies
+        return the classic three-tuple.
+        """
+        outputs = self.model(forward_type=ForwardType.SAC, obs=obs, **kwargs)
+        if len(outputs) == 4:
+            return outputs
+        actions, log_pi, shared_feature = outputs
+        return actions, log_pi, shared_feature, {}
+
+    def _probe_action_discrimination(self, shared_feature, extras, actions):
+        """Measure how much Q moves with the action at a fixed state.
+
+        Evaluates the critic on ``q_action_probe_samples`` perturbations of the
+        policy mean, plus the mean itself, the frozen pretrained mean and the
+        replay action, all on the same pooled features. Returns per-batch
+        scalar metrics; the caller runs it under ``no_grad``.
+        """
+        from rlinf.models.embodiment.starvla.utils import action_space as asu
+
+        mean = extras["mean_actions"].float()  # [B, chunks, dim], normalized
+        ref = extras.get("reference_mean_actions")
+        batch_size = mean.shape[0]
+        k = self.q_action_probe_samples
+        noise = torch.randn(
+            (k, *mean.shape), device=mean.device, dtype=mean.dtype
+        ) * (self.q_action_probe_sigma_scale * self.action_sigma)
+        probes = [mean.unsqueeze(0) + noise, mean.unsqueeze(0)]
+        if ref is not None:
+            probes.append(ref.float().unsqueeze(0))
+        stacked = torch.cat(probes, dim=0)  # [k + 1 (+1), B, chunks, dim]
+        num_rows = stacked.shape[0]
+        env_actions = asu.unnormalize_actions_for_env_torch(
+            stacked.reshape(num_rows * batch_size, *mean.shape[1:]),
+            self._action_norm_stats,
+            policy_setup=self._policy_setup,
+        )
+        data_actions = actions.float().reshape(batch_size, -1)
+        env_actions = torch.cat(
+            [env_actions.reshape(num_rows * batch_size, -1), data_actions], dim=0
+        )
+        features = torch.cat(
+            [shared_feature.repeat(num_rows, 1), shared_feature], dim=0
+        )
+        q = self.model(
+            forward_type=ForwardType.SAC_Q,
+            obs=None,
+            actions=env_actions,
+            shared_feature=features,
+            detach_encoder=True,
+        )
+        q = q.float().min(dim=-1).values  # same aggregation the actor sees
+        q_probe = q[: k * batch_size].reshape(k, batch_size)
+        q_mean = q[k * batch_size : (k + 1) * batch_size]
+        q_data = q[-batch_size:]
+        metrics = {
+            "q_action_std": q_probe.std(dim=0).mean().item(),
+            "q_action_range": (q_probe.max(dim=0).values - q_probe.min(dim=0).values)
+            .mean()
+            .item(),
+            "q_mean_action": q_mean.mean().item(),
+            "q_mean_minus_data": (q_mean - q_data).mean().item(),
+        }
+        if ref is not None:
+            q_ref = q[(k + 1) * batch_size : (k + 2) * batch_size]
+            metrics["q_ref_action"] = q_ref.mean().item()
+            metrics["q_mean_minus_ref"] = (q_mean - q_ref).mean().item()
+        return metrics
+
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
@@ -456,10 +552,20 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 discount = self.cfg.algorithm.gamma ** int(executed_chunks)
             else:
                 discount = self.cfg.algorithm.gamma
-            rewards_for_bootstrap = (
-                batch["rewards"].sum(dim=-1, keepdim=True).to(self.torch_dtype)
+            step_rewards = batch["rewards"]
+            if self.discount_within_chunk and step_rewards.ndim == 2:
+                # sum_i gamma^i r_i, consistent with the gamma^chunk bootstrap.
+                weights = self.cfg.algorithm.gamma ** torch.arange(
+                    step_rewards.shape[-1],
+                    device=step_rewards.device,
+                    dtype=torch.float32,
+                )
+                step_rewards = step_rewards.float() * weights
+            rewards_for_bootstrap = step_rewards.sum(dim=-1, keepdim=True).to(
+                self.torch_dtype
             )
         terminations = batch["terminations"].to(self.torch_dtype)
+        is_starvla = self.cfg.actor.model.model_type == "starvla"
 
         curr_obs = batch["curr_obs"]
         next_obs = batch["next_obs"]
@@ -476,8 +582,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 )
             if use_dsrl:
                 kwargs["train"] = True
-            next_state_actions, next_state_log_pi, shared_feature = self.model(
-                forward_type=ForwardType.SAC, obs=next_obs, **kwargs
+            next_state_actions, next_state_log_pi, shared_feature, _ = (
+                self._policy_forward(next_obs, **kwargs)
             )
             if next_state_log_pi.ndim == 1:
                 next_state_log_pi = next_state_log_pi.unsqueeze(-1)
@@ -533,17 +639,35 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 else:
                     raise NotImplementedError(f"{bootstrap_type=} is not supported!")
 
+        probe_metrics = {}
         if not use_crossq:
             dsrl_kwargs = {"train": True} if use_dsrl else {}
+            curr_feature = None
+            curr_extras = {}
+            if is_starvla and self.q_action_probe_samples > 0:
+                # One frozen-backbone pass on the current observation serves
+                # both the action probe and the data-Q input. The probe runs
+                # before the gradient-carrying Q forward so every no-grad
+                # forward precedes it, the same order the rest of this
+                # function already relies on under FSDP.
+                with torch.no_grad():
+                    _, _, curr_feature, curr_extras = self._policy_forward(
+                        curr_obs, **kwargs
+                    )
+                    if "mean_actions" in curr_extras:
+                        probe_metrics = self._probe_action_discrimination(
+                            curr_feature, curr_extras, actions
+                        )
             all_data_q_values = self.model(
                 forward_type=ForwardType.SAC_Q,
                 obs=curr_obs,
                 actions=actions,
+                shared_feature=curr_feature,
                 # StarVLA reuses the frozen VLM representation as critic
                 # state.  The critic optimizer owns only q_head parameters;
                 # detaching here prevents critic gradients from leaking into
                 # the action head and contaminating global gradient clipping.
-                detach_encoder=self.cfg.actor.model.model_type == "starvla",
+                detach_encoder=is_starvla,
                 **dsrl_kwargs,
             )
         else:
@@ -591,6 +715,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             "q_data_std": all_data_q_values.float().std(dim=0).mean().item()
             if all_data_q_values.shape[0] > 1
             else 0.0,
+            **probe_metrics,
         }
         if transition_valid is not None:
             metrics["transition_valid_fraction"] = transition_valid.mean().item()
@@ -610,8 +735,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             kwargs["temperature"] = self.cfg.algorithm.sampling_params.temperature_train
         if self.use_dsrl:
             kwargs["train"] = True
-        pi, log_pi, shared_feature = self.model(
-            forward_type=ForwardType.SAC, obs=curr_obs, **kwargs
+        pi, log_pi, shared_feature, extras = self._policy_forward(
+            curr_obs, **kwargs
         )
         if log_pi.ndim == 1:
             log_pi = log_pi.unsqueeze(-1)
@@ -652,42 +777,47 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         transition_valid = batch.get(TRANSITION_VALID_KEY)
         objective = (self.entropy_temp.alpha * log_pi) - qf_pi
         if self.bc_coef > 0:
-            # Distance to the action actually taken, measured in the policy's
-            # own normalized units so every channel counts equally. With a
-            # fixed exploration sigma this is the KL to the behaviour policy up
-            # to a constant factor.
-            # The policy returns [B, chunks, action_dim] while the replay
-            # buffer stores the chunk flattened, so flatten both before
-            # subtracting and only then restore the channel axis.
-            span = self.action_span.to(pi.dtype)
-            behaviour = batch["actions"].to(pi.dtype).reshape(pi.shape[0], -1)
-            # Report the drift in units of the exploration sigma, which is the
-            # scale that decides whether the policy survives: on this task PPO
-            # accumulates 0.4 sigma over a hundred updates and improves, while
-            # sampled success falls off a cliff past roughly 0.9 sigma. The
-            # squared distance also contains the sampling noise of the stored
-            # action, one sigma per channel, so subtract it.
-            delta = (pi.reshape(pi.shape[0], -1) - behaviour).reshape(
-                pi.shape[0], -1, span.shape[0]
-            )
-            bc_term = (2.0 * delta / span).square().mean(dim=(-1, -2), keepdim=False)
+            # TD3+BC anchor to the frozen pretrained head, mean to mean, in
+            # the policy's own normalized units. Anchoring to the replay
+            # action instead (attempts 5-8) anchors to a sliding window that
+            # the policy itself refills, so the leash moved with the policy and
+            # its length, measured between two noisy samples, was unreadable.
+            # This distance has no sampling noise in it: zero means the policy
+            # is exactly the checkpoint.
+            if "reference_mean_actions" not in extras:
+                raise ValueError(
+                    "algorithm.bc_coef > 0 needs the policy's reference mean "
+                    "action, which this model does not expose"
+                )
+            mean = extras["mean_actions"].float()
+            reference = extras["reference_mean_actions"].float()
+            delta = mean - reference  # [B, chunks, dim]
+            bc_term = delta.square().mean(dim=(-1, -2))
             # TD3+BC scaling keeps the trade-off independent of the Q scale,
             # which grows over training.
             scale = self.bc_coef / (qf_pi.detach().abs().mean() + 1e-6)
             objective = scale * objective + bc_term.reshape(-1, 1)
             metrics["bc_distance"] = bc_term.mean().item()
             metrics["bc_scale"] = scale.item()
-            # bc_distance carries two independent sampling noises, one in the
-            # stored action and one in the fresh reparameterised sample, so the
-            # floor is 2 sigma^2 rather than sigma^2. Subtracting only one
-            # reported zero drift as 0.66 sigma and produced a "cliff" that did
-            # not exist. Unnormalisation clamps actions to [-1, 1], which pulls
-            # the true floor slightly below 2 sigma^2, so small drifts still
-            # read as zero; treat changes in this number, not its level.
-            metrics["policy_drift_sigma"] = (
-                max(metrics["bc_distance"] - 2.0 * self.action_sigma**2, 0.0) ** 0.5
-                / self.action_sigma
-            )
+            with torch.no_grad():
+                sq = delta.square()
+                sigma = self.action_sigma
+                # RMS drift in exploration sigmas: overall, per channel group,
+                # and for the first and last executed chunk.
+                metrics["policy_drift_sigma"] = sq.mean().sqrt().item() / sigma
+                for name, (lo, hi) in self.policy_drift_groups.items():
+                    metrics[f"policy_drift_sigma/{name}"] = (
+                        sq[..., lo:hi].mean().sqrt().item() / sigma
+                    )
+                metrics["policy_drift_sigma/chunk_first"] = (
+                    sq[:, 0].mean().sqrt().item() / sigma
+                )
+                metrics["policy_drift_sigma/chunk_last"] = (
+                    sq[:, -1].mean().sqrt().item() / sigma
+                )
+                metrics["policy_drift_sigma/max_channel"] = (
+                    sq.mean(dim=(0, 1)).max().sqrt().item() / sigma
+                )
         actor_loss = masked_transition_mean(objective, transition_valid)
 
         entropy = -log_pi.mean()
@@ -704,9 +834,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 )
             if self.use_dsrl:
                 kwargs["train"] = True
-            _, log_pi, _ = self.model(
-                forward_type=ForwardType.SAC, obs=curr_obs, **kwargs
-            )
+            _, log_pi, _, _ = self._policy_forward(curr_obs, **kwargs)
             if log_pi.ndim == 1:
                 log_pi = log_pi.unsqueeze(-1)
             log_pi = log_pi.sum(dim=-1, keepdim=True)
@@ -776,18 +904,28 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         # its own replay buffer), so reduce them before branching: a rank that
         # took the branch alone would hang the others in an all-reduce.
         q_data_std = float(all_critic_metrics.get("critic/q_data_std", 0.0))
+        q_action_std = float(all_critic_metrics.get("critic/q_action_std", 0.0))
         decision = torch.tensor(
-            [q_data_std, float(train_actor)],
+            [q_data_std, float(train_actor), q_action_std],
             dtype=torch.float32,
             device=self.device,
         )
         if torch.distributed.is_initialized() and self._world_size > 1:
             torch.distributed.all_reduce(decision, op=torch.distributed.ReduceOp.AVG)
         q_data_std = float(decision[0])
+        q_action_std = float(decision[2])
         # AVG of the per-rank booleans is 1.0 only when every rank agrees.
         train_actor = bool(decision[1] >= 1.0)
-        critic_informative = q_data_std >= self.min_q_std_for_actor
+        # Spread over actions at a fixed state, relative to the spread over
+        # states. A critic that only learned V(s) scores ~0 here while passing
+        # the q_data_std gate.
+        q_action_ratio = q_action_std / (q_data_std + 1e-8)
+        critic_informative = q_data_std >= self.min_q_std_for_actor and (
+            q_action_ratio >= self.min_q_action_ratio_for_actor
+        )
         metrics_data["sac/q_data_std"] = q_data_std
+        metrics_data["sac/q_action_std"] = q_action_std
+        metrics_data["sac/q_action_ratio"] = q_action_ratio
         metrics_data["sac/critic_informative"] = float(critic_informative)
         train_actor = train_actor and critic_informative
         metrics_data["sac/actor_trained"] = float(

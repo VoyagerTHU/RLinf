@@ -81,13 +81,26 @@ algorithm:
   critic_actor_ratio: 2
   # Rollout steps of critic-only warmup before the actor may move. The previous
   # value of 2 let the actor follow dQ/da while Q was still a constant.
-  train_actor_steps: 15
+  train_actor_steps: 30
   # Hard gate on top of that warmup: the actor trains only while the critic
   # discriminates, measured as the batch-wise standard deviation of Q. The
   # collapsed run predicted ~0.011 for every sample (std ~0); with milestone
   # rewards in [0, 1] a spread of 0.05 is a low bar that a working critic
   # clears and a collapsed one never does.
   min_q_std_for_actor: 0.05
+  # q_data_std is a spread over states; a critic that learned only V(s) passes
+  # it while its dQ/da is noise, which is what attempts 3-8 ran the actor on.
+  # This probe evaluates Q at q_action_probe_samples actions around the policy
+  # mean (at q_action_probe_sigma_scale exploration sigmas) on the same state
+  # and reports their spread as critic/q_action_std, plus Q at the policy
+  # mean, the frozen pretrained mean and the replay action. The ratio gate
+  # requires that spread to be a fraction of the across-state spread before the
+  # actor trains; 0 would leave it as a diagnostic.
+  q_action_probe_samples: 4
+  q_action_probe_sigma_scale: 1.0
+  min_q_action_ratio_for_actor: 0.02
+  # Chunk return sum_i gamma^i r_i, consistent with the gamma^12 bootstrap.
+  discount_within_chunk: true
   # Behaviour anchor (TD3+BC). An informative critic was not enough: once the
   # gate opened at step 36 the actor drove q_pi from 0.11 to 0.27 while real
   # success fell from 0.41 to 0.06, the signature of a policy exploiting the
@@ -99,7 +112,17 @@ algorithm:
   # actions it was trained on and sampled success fell from 0.42 to 0.00, with
   # the cliff at roughly 0.9 sigma. PPO on this task accumulates 0.4 sigma over
   # a hundred updates and improves, so the leash has to hold well inside that.
+  # 2026-09-20: the anchor now points at the frozen pretrained head (mean to
+  # mean, no sampling noise) rather than at the replay action, which the
+  # policy itself keeps refilling. Same units as before, so the value carries.
   bc_coef: 0.005
+  # Channel groups for the actor/policy_drift_sigma breakdown (GR1 layout).
+  policy_drift_groups:
+    left_arm: [0, 7]
+    right_arm: [7, 14]
+    left_hand: [14, 20]
+    right_hand: [20, 26]
+    waist: [26, 29]
   enable_drq: false
 
   entropy_tuning:
@@ -160,6 +183,9 @@ env:
       mode: task_general
       coef: 1.0
       zero_potential_at_episode_end: false
+      # Success terminates the episode, so its potential is zeroed there; the
+      # bootstrap is cut on the same signal.
+      zero_potential_at_termination: true
       # Required whenever the terminal potential is not zeroed: the invariance
       # theorem is about gamma * Phi(s') - Phi(s). Matches algorithm.gamma,
       # which is per environment step.

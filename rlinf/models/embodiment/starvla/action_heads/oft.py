@@ -84,8 +84,13 @@ def _run_oft_backbone_and_head(
     *,
     model_inputs: dict[str, torch.Tensor],
     use_cache: bool,
-) -> tuple[torch.Tensor, torch.Tensor, Normal]:
-    """Run the shared OFT backbone/action-head path."""
+) -> tuple[torch.Tensor, torch.Tensor, Normal, torch.Tensor]:
+    """Run the shared OFT backbone/action-head path.
+
+    Also returns the action-token queries the head consumed, so a frozen copy of
+    the head can be evaluated on the same features without a second backbone
+    pass.
+    """
     backbone_output = run_backbone_pipeline(
         policy,
         action_head_name="oft",
@@ -122,7 +127,7 @@ def _run_oft_backbone_and_head(
     # environment.
     mean_actions = mean_actions[:, : policy.num_executed_action_chunks]
     dist = Normal(mean_actions, torch.exp(policy.actor_logstd).view(1, 1, -1))
-    return mean_actions, last_hidden, dist
+    return mean_actions, last_hidden, dist, action_queries
 
 
 def run_default_forward_oft(
@@ -150,7 +155,7 @@ def run_default_forward_oft(
         ignored_keys=RL_BATCH_TENSOR_KEYS_TO_IGNORE,
     )
 
-    mean_actions, last_hidden, dist = _run_oft_backbone_and_head(
+    mean_actions, last_hidden, dist, _ = _run_oft_backbone_and_head(
         policy,
         model_inputs=model_inputs,
         use_cache=use_cache,
@@ -199,7 +204,7 @@ def run_rollout_oft(
         num_action_chunks=policy.num_action_chunks,
         examples=examples,
     )
-    mean_actions, last_hidden, dist = _run_oft_backbone_and_head(
+    mean_actions, last_hidden, dist, _ = _run_oft_backbone_and_head(
         policy,
         model_inputs=model_inputs,
         use_cache=False,

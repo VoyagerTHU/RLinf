@@ -36,6 +36,7 @@ def _stub_env(*, shaping: bool, mode: str = "drawer"):
     env.shaping_mode = mode
     env.shaping_coef = 1.0
     env.shaping_zero_at_episode_end = True
+    env.shaping_zero_at_termination = False
     env.shaping_gamma = 1.0
     env.grasp_reward = 0.1
     env.in_drawer_reward = 0.5
@@ -140,3 +141,32 @@ def test_binary_reward_still_tracks_subtask_diagnostics():
         np.asarray([True]), np.asarray([False]), [{"subtask_signals": {}}]
     )
     np.testing.assert_allclose(reward, [1.0])
+
+
+def test_bootstrapping_recipe_zeroes_the_potential_on_success_only():
+    """SAC keeps Phi across truncation (it bootstraps there) but success is
+    terminal, so its potential is zeroed on that step and nowhere else."""
+    env = _stub_env(shaping=True, mode="task_general")
+    env.shaping_zero_at_episode_end = False
+    env.shaping_zero_at_termination = True
+    env.shaping_gamma = 1.0
+    env.prev_potential = np.asarray([0.7], dtype=np.float32)
+    infos = [
+        {
+            "progress_stages": {
+                "grasped": True,
+                "placed": True,
+                "released": True,
+            }
+        }
+    ]
+    # Truncation without success: potential is carried, not zeroed.
+    reward = env._calc_step_reward(
+        np.asarray([False]), np.asarray([True]), infos
+    )
+    np.testing.assert_allclose(env.prev_potential, [0.7])
+    np.testing.assert_allclose(reward, [0.0])
+    # Success terminates: the task reward fires and the potential drops to 0.
+    reward = env._calc_step_reward(np.asarray([True]), np.asarray([False]), infos)
+    np.testing.assert_allclose(env.prev_potential, [0.0])
+    np.testing.assert_allclose(reward, [1.0 - 0.7])

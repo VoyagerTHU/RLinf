@@ -204,6 +204,14 @@ class RoboCasaGR1Env(gym.Env):
         # gamma * Phi(s') - Phi(s). Episodic recipes get the invariance from
         # zeroing the terminal potential and can leave this at 1; bootstrapping
         # recipes must set the per-environment-step discount.
+        # Force the potential to zero on the step the task terminates
+        # (success), separately from truncation. A terminal state has no
+        # future, so its potential should be zero for the shaping to be a pure
+        # potential difference; leaving Phi(success) = 1 adds a constant
+        # gamma * coef bonus on top of the task reward on the last chunk.
+        self.shaping_zero_at_termination = bool(
+            shaping_cfg.get("zero_potential_at_termination", False)
+        )
         self.shaping_gamma = float(shaping_cfg.get("gamma", 1.0))
         if not 0.0 < self.shaping_gamma <= 1.0:
             raise ValueError(
@@ -526,12 +534,22 @@ class RoboCasaGR1Env(gym.Env):
         potential = (
             drawer_potential if self.shaping_mode == "drawer" else general_potential
         )
+        truncations = np.asarray(truncations, dtype=bool)
+        terminated = np.asarray(terminations, dtype=bool)
+        if self.shaping_zero_at_episode_end and self.shaping_zero_at_termination:
+            episode_over = truncations | terminated
+        elif self.shaping_zero_at_episode_end:
+            episode_over = truncations
+        else:
+            episode_over = terminated
         shaping_reward, self.prev_potential = potential_shaping_reward(
             potential,
             self.prev_potential,
-            episode_over=truncations,
+            episode_over=episode_over,
             coef=self.shaping_coef,
-            zero_at_episode_end=self.shaping_zero_at_episode_end,
+            zero_at_episode_end=(
+                self.shaping_zero_at_episode_end or self.shaping_zero_at_termination
+            ),
             gamma=self.shaping_gamma,
         )
         return task_reward + shaping_reward
