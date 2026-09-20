@@ -677,8 +677,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             objective = scale * objective + bc_term.reshape(-1, 1)
             metrics["bc_distance"] = bc_term.mean().item()
             metrics["bc_scale"] = scale.item()
+            # bc_distance carries two independent sampling noises, one in the
+            # stored action and one in the fresh reparameterised sample, so the
+            # floor is 2 sigma^2 rather than sigma^2. Subtracting only one
+            # reported zero drift as 0.66 sigma and produced a "cliff" that did
+            # not exist. Unnormalisation clamps actions to [-1, 1], which pulls
+            # the true floor slightly below 2 sigma^2, so small drifts still
+            # read as zero; treat changes in this number, not its level.
             metrics["policy_drift_sigma"] = (
-                max(metrics["bc_distance"] - self.action_sigma**2, 0.0) ** 0.5
+                max(metrics["bc_distance"] - 2.0 * self.action_sigma**2, 0.0) ** 0.5
                 / self.action_sigma
             )
         actor_loss = masked_transition_mean(objective, transition_valid)
