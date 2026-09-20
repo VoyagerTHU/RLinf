@@ -252,6 +252,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         # to 0.06. Pulling the policy toward the actions actually taken bounds
         # that drift. 0 disables the term.
         self.bc_coef = float(self.cfg.algorithm.get("bc_coef", 0.0))
+        self.action_sigma = float(
+            np.exp(self.cfg.actor.model.get("initial_logstd", -2.5))
+        )
         self.action_span = None
         if self.bc_coef > 0:
             stats = getattr(unwrap_module(self.model), "_action_norm_stats", None)
@@ -658,6 +661,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             # subtracting and only then restore the channel axis.
             span = self.action_span.to(pi.dtype)
             behaviour = batch["actions"].to(pi.dtype).reshape(pi.shape[0], -1)
+            # Report the drift in units of the exploration sigma, which is the
+            # scale that decides whether the policy survives: on this task PPO
+            # accumulates 0.4 sigma over a hundred updates and improves, while
+            # sampled success falls off a cliff past roughly 0.9 sigma. The
+            # squared distance also contains the sampling noise of the stored
+            # action, one sigma per channel, so subtract it.
             delta = (pi.reshape(pi.shape[0], -1) - behaviour).reshape(
                 pi.shape[0], -1, span.shape[0]
             )
@@ -668,6 +677,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             objective = scale * objective + bc_term.reshape(-1, 1)
             metrics["bc_distance"] = bc_term.mean().item()
             metrics["bc_scale"] = scale.item()
+            metrics["policy_drift_sigma"] = (
+                max(metrics["bc_distance"] - self.action_sigma**2, 0.0) ** 0.5
+                / self.action_sigma
+            )
         actor_loss = masked_transition_mean(objective, transition_valid)
 
         entropy = -log_pi.mean()

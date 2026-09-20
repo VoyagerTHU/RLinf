@@ -94,8 +94,12 @@ algorithm:
   # critic's error on actions it never saw. This weights Q against the squared
   # distance to the action actually taken, in normalized action units, and is
   # rescaled by the running |Q| so the trade-off does not drift as Q grows.
-  # Smaller means a tighter leash; 0 disables the anchor.
-  bc_coef: 0.1
+  # Smaller means a tighter leash; 0 disables the anchor. 0.1 was not enough:
+  # the policy drifted monotonically from 0.66 to 1.30 sigma away from the
+  # actions it was trained on and sampled success fell from 0.42 to 0.00, with
+  # the cliff at roughly 0.9 sigma. PPO on this task accumulates 0.4 sigma over
+  # a hundred updates and improves, so the leash has to hold well inside that.
+  bc_coef: 0.005
   enable_drq: false
 
   entropy_tuning:
