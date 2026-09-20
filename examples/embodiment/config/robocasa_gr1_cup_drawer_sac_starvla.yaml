@@ -95,10 +95,13 @@ algorithm:
   # and reports their spread as critic/q_action_std, plus Q at the policy
   # mean, the frozen pretrained mean and the replay action. The ratio gate
   # requires that spread to be a fraction of the across-state spread before the
-  # actor trains; 0 would leave it as a diagnostic.
+  # actor trains; 0 would leave it as a diagnostic. The smoke test measured
+  # ~0.014 for a critic after 8-16 updates, so 0.01 only blocks the case where
+  # the action pathway falls behind the state pathway as the critic trains,
+  # i.e. a critic that became V(s).
   q_action_probe_samples: 4
   q_action_probe_sigma_scale: 1.0
-  min_q_action_ratio_for_actor: 0.02
+  min_q_action_ratio_for_actor: 0.01
   # Chunk return sum_i gamma^i r_i, consistent with the gamma^12 bootstrap.
   discount_within_chunk: true
   # Behaviour anchor (TD3+BC). An informative critic was not enough: once the
