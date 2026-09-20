@@ -153,6 +153,7 @@ def potential_shaping_reward(
     episode_over: np.ndarray,
     coef: float = 1.0,
     zero_at_episode_end: bool = True,
+    gamma: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Additive potential-based shaping.
 
@@ -168,15 +169,19 @@ def potential_shaping_reward(
     reward on the last chunk of every episode, at states that look like "task
     completed" and are indistinguishable from mid-episode ones without a clock,
     so the critic learns to devalue exactly the states it most needs to value.
-    Off-policy recipes therefore set this to ``False`` and take the plain
-    potential difference, which is policy-invariant in the bootstrapped
-    (infinite-horizon) view.
+    Off-policy recipes therefore set this to ``False`` and must instead supply
+    the discount, because the invariance theorem requires
+    ``gamma * Phi(s') - Phi(s)``, not the plain difference. Dropping the factor
+    pays ``(1 - gamma) * Phi`` every step for merely staying put, which a
+    bootstrapping learner collects as a perpetuity: a run with gamma left at 1
+    taught the policy to grasp the object and hold it (grasped_once 0.81) while
+    never placing it (placed_once 0.03), and Q rose the whole way because that
+    really was the better shaped return.
     """
     next_potential = (
         np.where(np.asarray(episode_over, dtype=bool), 0.0, potential)
         if zero_at_episode_end
         else np.asarray(potential)
     ).astype(np.float32)
-    return (float(coef) * (next_potential - prev_potential)).astype(
-        np.float32
-    ), next_potential
+    shaping = float(coef) * (float(gamma) * next_potential - prev_potential)
+    return shaping.astype(np.float32), next_potential

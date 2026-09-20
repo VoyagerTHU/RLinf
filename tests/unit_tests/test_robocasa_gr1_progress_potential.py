@@ -191,3 +191,44 @@ def test_zeroing_mode_still_telescopes() -> None:
         )
         total += float(reward[0])
     assert abs(total) < 1e-6
+
+
+def test_standing_still_in_a_high_potential_state_pays_nothing_with_gamma() -> None:
+    # Without the discount, holding a grasp paid (1 - gamma) * Phi every step,
+    # which a bootstrapping critic banks as a perpetuity; the policy learned to
+    # grasp and stop. With gamma the reward for staying put is zero.
+    held = np.asarray([0.2], dtype=np.float32)
+    plain, _ = progress.potential_shaping_reward(
+        held, held, episode_over=np.asarray([False]), zero_at_episode_end=False
+    )
+    discounted, _ = progress.potential_shaping_reward(
+        held,
+        held,
+        episode_over=np.asarray([False]),
+        zero_at_episode_end=False,
+        gamma=0.999,
+    )
+    assert float(plain[0]) == 0.0
+    assert float(discounted[0]) < 0.0  # standing still now costs, never pays
+
+
+def test_progress_still_pays_under_the_discount() -> None:
+    reward, _ = progress.potential_shaping_reward(
+        np.asarray([0.5], dtype=np.float32),
+        np.asarray([0.2], dtype=np.float32),
+        episode_over=np.asarray([False]),
+        zero_at_episode_end=False,
+        gamma=0.999,
+    )
+    assert 0.29 < float(reward[0]) < 0.3
+
+
+def test_gamma_defaults_to_one_for_episodic_recipes() -> None:
+    # The PPO recipe relies on zeroing rather than the discount, so the default
+    # must keep its exact telescoping behaviour.
+    reward, _ = progress.potential_shaping_reward(
+        np.asarray([0.5], dtype=np.float32),
+        np.asarray([0.2], dtype=np.float32),
+        episode_over=np.asarray([False]),
+    )
+    assert np.allclose(reward, [0.3])

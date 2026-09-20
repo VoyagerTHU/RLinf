@@ -160,6 +160,10 @@ env:
       mode: task_general
       coef: 1.0
       zero_potential_at_episode_end: false
+      # Required whenever the terminal potential is not zeroed: the invariance
+      # theorem is about gamma * Phi(s') - Phi(s). Matches algorithm.gamma,
+      # which is per environment step.
+      gamma: 0.999
       grasped: 0.2
       placed: 0.5
       released: 0.7

@@ -200,6 +200,16 @@ class RoboCasaGR1Env(gym.Env):
         self.shaping_zero_at_episode_end = bool(
             shaping_cfg.get("zero_potential_at_episode_end", True)
         )
+        # Potential-based shaping is only policy-invariant as
+        # gamma * Phi(s') - Phi(s). Episodic recipes get the invariance from
+        # zeroing the terminal potential and can leave this at 1; bootstrapping
+        # recipes must set the per-environment-step discount.
+        self.shaping_gamma = float(shaping_cfg.get("gamma", 1.0))
+        if not 0.0 < self.shaping_gamma <= 1.0:
+            raise ValueError(
+                "subtask_reward_shaping.gamma must be in (0, 1], got "
+                f"{self.shaping_gamma}"
+            )
         self.action_steps_per_chunk = cfg.get("action_steps_per_chunk", None)
         if self.action_steps_per_chunk is not None:
             self.action_steps_per_chunk = int(self.action_steps_per_chunk)
@@ -522,6 +532,7 @@ class RoboCasaGR1Env(gym.Env):
             episode_over=truncations,
             coef=self.shaping_coef,
             zero_at_episode_end=self.shaping_zero_at_episode_end,
+            gamma=self.shaping_gamma,
         )
         return task_reward + shaping_reward
 
