@@ -112,6 +112,10 @@ def remove_training_only_value_head(
         "model.value_head.",
         "q_head.",
         "model.q_head.",
+        # Frozen copy of the pretrained action head that the SAC actor is
+        # anchored to; it never chooses actions.
+        "reference_action_model.",
+        "model.reference_action_model.",
     )
     return {
         key: value
