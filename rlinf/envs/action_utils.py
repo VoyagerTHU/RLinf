@@ -275,6 +275,9 @@ def prepare_actions(
         )
     elif env_type == SupportedEnvType.ROBOCASA_GR1:
         chunk_actions = raw_chunk_actions
+    elif env_type == SupportedEnvType.SOLVER_KITCHEN:
+        # Sixteen continuous joint targets; the env maps [-1, 1] to limits.
+        chunk_actions = raw_chunk_actions
     elif env_type == SupportedEnvType.REALWORLD:
         chunk_actions = raw_chunk_actions
     elif env_type == SupportedEnvType.FRANKASIM:

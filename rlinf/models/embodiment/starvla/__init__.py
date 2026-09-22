@@ -302,7 +302,22 @@ def get_model(
         sac_task_description=getattr(cfg, "sac_task_description", None),
         value_head_zero_init=bool(getattr(cfg, "value_head_zero_init", True)),
         value_head_input_norm=getattr(cfg, "value_head_input_norm", "layer_norm"),
+        action_norm_stats=_plain_container(getattr(cfg, "action_norm_stats", None)),
     )
+
+
+def _plain_container(value):
+    """Convert OmegaConf nodes to plain Python so stats overrides pickle cleanly."""
+    if value is None:
+        return None
+    try:
+        from omegaconf import DictConfig, ListConfig, OmegaConf
+
+        if isinstance(value, (DictConfig, ListConfig)):
+            return OmegaConf.to_container(value, resolve=True)
+    except ImportError:  # pragma: no cover
+        pass
+    return value
 
 
 __all__ = [

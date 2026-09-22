@@ -262,6 +262,30 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.policy_drift_groups = {
             str(name): (int(bounds[0]), int(bounds[1])) for name, bounds in groups.items()
         }
+        # Per-channel anchor weight, built from policy_drift_groups plus
+        # algorithm.policy_drift_group_weights ({name: multiplier}, default 1
+        # for any channel outside a listed group or any unlisted group). Runs
+        # 9-11 all showed damage concentrated in specific channels (arms and
+        # waist drifted 2-4x more than hands, and that is exactly where the
+        # task fails: grasp, driven by the hands, survives while placement,
+        # driven by the arms and waist, does not) while a single scalar
+        # bc_coef anchors every channel equally. Left at 1.0 everywhere this
+        # is exactly the old uniform anchor.
+        self.action_channel_weight = None
+        group_weights = self.cfg.algorithm.get("policy_drift_group_weights", None)
+        if group_weights:
+            action_dim = int(self.cfg.actor.model.action_dim)
+            weight = torch.ones(action_dim, dtype=torch.float32, device=self.device)
+            for name, multiplier in group_weights.items():
+                if name not in self.policy_drift_groups:
+                    raise ValueError(
+                        f"policy_drift_group_weights names {name!r}, which is "
+                        "not one of policy_drift_groups "
+                        f"{sorted(self.policy_drift_groups)}"
+                    )
+                lo, hi = self.policy_drift_groups[name]
+                weight[lo:hi] = float(multiplier)
+            self.action_channel_weight = weight
         # Critic action-discrimination probe. For each state the critic is
         # evaluated on `q_action_probe_samples` actions drawn around the
         # policy mean at `q_action_probe_sigma_scale` exploration sigmas; the
@@ -792,7 +816,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             mean = extras["mean_actions"].float()
             reference = extras["reference_mean_actions"].float()
             delta = mean - reference  # [B, chunks, dim]
-            bc_term = delta.square().mean(dim=(-1, -2))
+            if self.action_channel_weight is not None:
+                bc_term = (
+                    self.action_channel_weight.to(delta.dtype) * delta.square()
+                ).mean(dim=(-1, -2))
+            else:
+                bc_term = delta.square().mean(dim=(-1, -2))
             # TD3+BC scaling keeps the trade-off independent of the Q scale,
             # which grows over training.
             scale = self.bc_coef / (qf_pi.detach().abs().mean() + 1e-6)

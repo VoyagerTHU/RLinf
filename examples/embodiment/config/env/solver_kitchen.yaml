@@ -1,0 +1,107 @@
+# Solver kitchen reach task (Newton + MuJoCo-Warp, dual-PiPER, 16 joint targets).
+# The simulator runs in a subprocess with its own interpreter (SOLVER_PYTHON);
+# see rlinf/envs/solver_kitchen and SOLVER_KITCHEN_INTEGRATION_PLAN.md.
+env_type: solver_kitchen
+task_name: solver_kitchen_reach_knife
+
+total_num_envs: null
+group_size: 1
+# RLinf resets the whole batch between rollout epochs so every seed group
+# starts from the same state; the solver must never auto reset.
+auto_reset: false
+ignore_terminations: false
+max_episode_steps: 300
+max_steps_per_rollout_epoch: 300
+use_rel_reward: false
+reward_coef: 1.0
+# solver: shaped reach reward from KitchenReachTask (PPO).
+# success: binary 1.0 on the first success step (GRPO, matches RoboCasa GR1).
+reward_mode: solver
+success_reward: 1.0
+is_eval: false
+
+seed: 20260921
+seed_sampler_seed: 20260921
+seed_manifest: null
+seed_pool_size: 500
+eval_seed_count: null
+
+task_description: "reach the knife handle with the right gripper"
+# null executes the whole predicted chunk; set lower to replan early.
+action_steps_per_chunk: null
+
+# subprocess: launch bridge_server.py with `solver_python` (recommended).
+# inprocess: import solver into the current interpreter (solver venv only).
+backend: subprocess
+solver_python: ${oc.env:SOLVER_PYTHON,null}
+solver_root: ${oc.env:SOLVER_ROOT,null}
+solver_env_vars: {}
+
+render: true
+# null -> render every physics step only when video recording is on;
+# otherwise render once per action chunk (when the policy observes).
+render_every_step: null
+main_camera: main
+
+sim:
+  # RLinf assigns one GPU per EnvWorker through CUDA_VISIBLE_DEVICES.
+  device: cuda:0
+  fps: 60
+  sim_substeps: 8
+  graph_capture: true
+  deterministic_gpu: true
+  deterministic_contacts: true
+  deterministic_solver: true
+  enable_shadows: true
+
+# KitchenReachTaskConfig fields (solver/rl/kitchen_task.py).
+task:
+  end_effector_label: right_gripper_base
+  object_label: knife
+  end_effector_offset: [0.0, 0.0, 0.12]
+  target_frame: object_local
+  target_offset: [0.0, 0.0, 0.05]
+  target_randomization_range: [0.05, 0.05, 0.02]
+  target_randomization_probability: 1.0
+  distance_sigma: 0.1
+  success_threshold: 0.03
+  reach_reward_scale: 4.0
+  progress_reward_scale: 2.0
+  action_rate_scale: 0.01
+  time_penalty_scale: 0.0
+  success_bonus: 2.0
+  failure_penalty: -1.0
+  max_reach_distance: 1.5
+  success_hold_steps: 5
+  terminate_on_success: true
+
+# KitchenTorchEnvConfig fields (solver/rl/torch_env.py). Policies emit
+# actions in [-1, 1]; the solver maps them to joint-limit-aware targets.
+torch_env:
+  normalized_actions: true
+  action_scale: 0.5
+  joint_target_speed_limit: 0.0
+  joint_target_acceleration_limit: 0.0
+  joint_velocity_penalty_scale: 0.0
+  joint_acceleration_penalty_scale: 0.0
+
+# TiledCameraViewer cameras; poses are meters in the world frame, `look_at`
+# derives the orientation. The first camera is the policy's main image.
+cameras:
+  - name: main
+    width: 224
+    height: 224
+    position: [0.0, 0.55, 1.75]
+    look_at: [0.0, 1.65, 0.95]
+    vertical_fov_degrees: 45.0
+
+video_cfg:
+  save_video: false
+  info_on_video: true
+  fps: 20
+  extra_info_on_video:
+    - episode.success_once
+    - episode.sample_seed
+    - episode.sample_group
+    - episode.sample_trajectory
+  video_base_dir: ${runner.logger.log_path}/video/train

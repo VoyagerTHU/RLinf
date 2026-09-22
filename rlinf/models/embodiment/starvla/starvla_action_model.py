@@ -160,6 +160,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         sac_task_description: Optional[str] = None,
         value_head_zero_init: bool = True,
         value_head_input_norm: Optional[str] = "layer_norm",
+        action_norm_stats: Optional[Any] = None,
     ):
         super().__init__()
 
@@ -195,6 +196,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             action_dim=self.action_dim,
             action_stats_source=self.action_stats_source,
             preserve_float64=self.policy_setup == "gr1",
+            override_stats=action_norm_stats,
         )
 
         # 3) Dispatch profile (action head + state adapter).

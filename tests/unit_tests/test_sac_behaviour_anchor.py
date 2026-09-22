@@ -147,3 +147,29 @@ def test_the_reference_anchor_keeps_the_replay_anchor_units() -> None:
         _reference_anchor(delta_norm, torch.zeros(1, 12, 29)),
         atol=1e-6,
     )
+
+
+def test_per_channel_group_weight_penalizes_that_group_more() -> None:
+    """Mirror of the worker's weighted anchor: weight multiplies delta^2."""
+    weight = torch.ones(29)
+    weight[0:14] = 3.0  # left_arm + right_arm
+    weight[26:29] = 3.0  # waist
+
+    def weighted_term(delta: torch.Tensor) -> torch.Tensor:
+        return (weight * delta.square()).mean(dim=(-1, -2))
+
+    arm_delta = torch.zeros(1, 12, 29)
+    arm_delta[..., 0] = 0.1
+    hand_delta = torch.zeros(1, 12, 29)
+    hand_delta[..., 14] = 0.1  # left_hand, unweighted
+    assert weighted_term(arm_delta) > weighted_term(hand_delta)
+    assert torch.allclose(
+        weighted_term(hand_delta), hand_delta.square().mean(dim=(-1, -2))
+    )
+
+
+def test_uniform_weight_reduces_to_the_unweighted_anchor() -> None:
+    weight = torch.ones(29)
+    delta = torch.rand(3, 12, 29)
+    weighted = (weight * delta.square()).mean(dim=(-1, -2))
+    assert torch.allclose(weighted, delta.square().mean(dim=(-1, -2)))

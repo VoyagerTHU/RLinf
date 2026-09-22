@@ -30,19 +30,26 @@ def resolve_action_norm_stats(
     action_dim: int,
     action_stats_source: Optional[str] = None,
     preserve_float64: bool = False,
+    override_stats: Optional[Any] = None,
 ) -> Optional[dict[str, np.ndarray]]:
     """Resolve action normalization stats from starVLA.
 
     Strict contract:
       - If unnorm_key is None, return None (caller opted out of unnormalization).
       - If unnorm_key is not None, return valid stats or raise an exception.
+      - ``override_stats`` bypasses the checkpoint: either the string
+        ``"identity"`` (every channel spans [-1, 1], for environments that
+        consume normalized actions such as solver_kitchen) or a mapping with
+        ``min``/``max`` (and optionally ``q01``/``q99``/``mask``) arrays.
     """
     if unnorm_key is None:
         return None
 
     raw_stats: Any = None
     norm_stats = getattr(starvla_model, "norm_stats", None)
-    if isinstance(norm_stats, Mapping) and unnorm_key in norm_stats:
+    if override_stats is not None:
+        raw_stats = _override_stats_payload(override_stats, action_dim)
+    elif isinstance(norm_stats, Mapping) and unnorm_key in norm_stats:
         raw_stats = norm_stats.get(unnorm_key)
     else:
         getter = getattr(starvla_model, "get_action_stats", None)
@@ -133,7 +140,31 @@ def resolve_action_norm_stats(
     }
 
 
+def _override_stats_payload(override_stats: Any, action_dim: int) -> dict[str, Any]:
+    """Turn a config-provided stats override into a checkpoint-like payload."""
+    if isinstance(override_stats, str):
+        if override_stats.strip().lower() != "identity":
+            raise ValueError(
+                "action_norm_stats string override must be 'identity', "
+                f"got {override_stats!r}"
+            )
+        ones = [1.0] * int(action_dim)
+        neg = [-1.0] * int(action_dim)
+        return {"action": {"min": neg, "max": ones, "q01": neg, "q99": ones}}
+    if isinstance(override_stats, Mapping):
+        payload = dict(override_stats)
+        payload = payload.get("action", payload)
+        return {"action": dict(payload)}
+    raise ValueError(
+        "action_norm_stats override must be 'identity' or a mapping with "
+        f"min/max arrays, got {type(override_stats).__name__}"
+    )
+
+
 _LIBERO_PLATFORMS = {"libero"}
+# Platforms whose channels are all continuous min-max targets (no gripper
+# remapping): RoboCasa GR1 and the solver kitchen dual-PiPER.
+_CONTINUOUS_PLATFORMS = {"gr1", "solver_kitchen"}
 
 
 def _gripper_mapping(
@@ -192,13 +223,13 @@ def unnormalize_actions_for_env(
     actions = np.asarray(normalized_actions, dtype=np.float32)
     flat = actions.reshape(-1, actions.shape[-1]).astype(np.float32, copy=False)
     resolved_platform = str(policy_setup or "").strip().lower()
-    stats_dtype = None if resolved_platform == "gr1" else np.float32
+    stats_dtype = None if resolved_platform in _CONTINUOUS_PLATFORMS else np.float32
     starvla_stats = {
         "q99": np.asarray(action_norm_stats["q99"], dtype=stats_dtype),
         "q01": np.asarray(action_norm_stats["q01"], dtype=stats_dtype),
         "mask": np.asarray(action_norm_stats["mask"], dtype=bool),
     }
-    if resolved_platform == "gr1":
+    if resolved_platform in _CONTINUOUS_PLATFORMS:
         # RoboCasa-GR1 uses all 29 channels as continuous arm, hand, and waist
         # controls.  In particular, channel 6 is a left-arm joint rather than
         # the binary gripper channel assumed by baseframework's LIBERO helper.
@@ -219,7 +250,7 @@ def unnormalize_actions_for_env(
                 "starVLA is required for action unnormalization but is not importable."
             ) from exc
         env_flat = baseframework.unnormalize_actions(flat, starvla_stats)
-    output_dtype = None if resolved_platform == "gr1" else np.float32
+    output_dtype = None if resolved_platform in _CONTINUOUS_PLATFORMS else np.float32
     env_actions = np.asarray(env_flat, dtype=output_dtype).reshape(actions.shape)
     return _gripper_mapping(env_actions, policy_setup=policy_setup)
 
@@ -240,10 +271,10 @@ def normalize_actions_from_env_torch(
     if action_norm_stats is None:
         raise RuntimeError("Missing action_norm_stats for torch normalization")
     resolved_platform = str(policy_setup or "").strip().lower()
-    if resolved_platform != "gr1":
+    if resolved_platform not in _CONTINUOUS_PLATFORMS:
         raise NotImplementedError(
             "Differentiable StarVLA action normalization currently supports "
-            f"only policy_setup='gr1', got {policy_setup!r}"
+            f"only policy_setup in {sorted(_CONTINUOUS_PLATFORMS)}, got {policy_setup!r}"
         )
     dtype = env_actions.dtype
     device = env_actions.device
@@ -271,10 +302,10 @@ def unnormalize_actions_for_env_torch(
         raise RuntimeError("Missing action_norm_stats for torch unnormalization")
 
     resolved_platform = str(policy_setup or "").strip().lower()
-    if resolved_platform != "gr1":
+    if resolved_platform not in _CONTINUOUS_PLATFORMS:
         raise NotImplementedError(
             "Differentiable StarVLA action unnormalization currently supports "
-            f"only policy_setup='gr1', got {policy_setup!r}"
+            f"only policy_setup in {sorted(_CONTINUOUS_PLATFORMS)}, got {policy_setup!r}"
         )
 
     actions = normalized_actions.clamp(-1.0, 1.0)

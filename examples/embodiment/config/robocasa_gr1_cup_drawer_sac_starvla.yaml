@@ -119,6 +119,15 @@ algorithm:
   # mean, no sampling noise) rather than at the replay action, which the
   # policy itself keeps refilling. Same units as before, so the value carries.
   bc_coef: 0.005
+  # Per-channel anchor multiplier ({group name (from policy_drift_groups
+  # below): weight}, default 1). Attempts 9-11 showed damage concentrated in
+  # the arms and waist (drift 2-4x the hands') and correlated with placement
+  # failure while grasp (driven by the hands) survived, so anchor those
+  # channels 3x tighter than the uniform bc_coef anchors the rest.
+  policy_drift_group_weights:
+    left_arm: 3.0
+    right_arm: 3.0
+    waist: 3.0
   # Channel groups for the actor/policy_drift_sigma breakdown (GR1 layout).
   policy_drift_groups:
     left_arm: [0, 7]

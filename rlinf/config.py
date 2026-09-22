@@ -831,6 +831,34 @@ def _validate_actor_batch_divides_rollout(
     )
 
 
+def _validate_solver_kitchen_env(env_cfg, section: str) -> None:
+    """Reject solver_kitchen env settings that break grouped-seed rollouts."""
+    if env_cfg is None or env_cfg.get("env_type", None) != "solver_kitchen":
+        return
+    if bool(env_cfg.get("auto_reset", False)):
+        raise ValueError(
+            f"env.{section}.auto_reset must be false for solver_kitchen: RLinf "
+            "resets the whole batch between rollout epochs so that every seed "
+            "group starts from the same state"
+        )
+    backend = str(env_cfg.get("backend", "subprocess")).strip().lower()
+    if backend not in ("subprocess", "inprocess", "in_process", "in-process", "auto"):
+        raise ValueError(
+            f"env.{section}.backend must be subprocess, inprocess or auto, got {backend!r}"
+        )
+    if bool(env_cfg.get("render", True)):
+        cameras = env_cfg.get("cameras", None)
+        if cameras is not None and len(cameras) == 0:
+            raise ValueError(
+                f"env.{section}.cameras must list at least one camera when render is true"
+            )
+    reward_mode = str(env_cfg.get("reward_mode", "solver")).strip().lower()
+    if reward_mode not in ("solver", "success"):
+        raise ValueError(
+            f"env.{section}.reward_mode must be 'solver' or 'success', got {reward_mode!r}"
+        )
+
+
 def _validate_robocasa_gr1_multitask_eval(cfg) -> None:
     """Check that a multi-task RoboCasa GR1 evaluation visits every seed once.
 
@@ -907,6 +935,7 @@ def validate_embodied_cfg(cfg):
             "env.eval.total_num_envs // env_world_size // rollout.pipeline_stage_num must be greater than 0"
         )
         _validate_robocasa_gr1_multitask_eval(cfg)
+        _validate_solver_kitchen_env(cfg.env.eval, "eval")
         assert (
             cfg.env.eval.total_num_envs
             // env_world_size
@@ -928,6 +957,7 @@ def validate_embodied_cfg(cfg):
         assert cfg.env.train.total_num_envs > 0, (
             "Total number of parallel environments for training must be greater than 0"
         )
+        _validate_solver_kitchen_env(cfg.env.train, "train")
         assert cfg.env.train.total_num_envs % env_world_size == 0, (
             "Total number of parallel environments for training must be divisible by the number of environment processes"
         )
