@@ -181,7 +181,7 @@ class StarVLAEditPolicy(nn.Module):
         nn.init.zeros_(self.log_std_head.weight)
         nn.init.constant_(self.log_std_head.bias, -1.0)
 
-    def sample(
+    def forward(
         self,
         state_features: torch.Tensor,
         base_action_flat: torch.Tensor,
@@ -192,6 +192,15 @@ class StarVLAEditPolicy(nn.Module):
         Returns ``(edit, log_prob)`` in normalized action units, both flat
         over the chunk/dim axes like ``base_action_flat``. ``log_prob`` is
         ``None`` in eval mode (the edit is then the deterministic mode).
+
+        Named ``forward`` rather than a differently-named method (this
+        module used to expose ``sample``) so calling it as ``self.edit_policy(...)``
+        goes through ``nn.Module.__call__``: FSDP's parameter-gathering hooks
+        fire on ``forward``/``__call__`` only, and this module is wrapped as
+        its own FSDP unit (see wrap_policy.module_classes_to_wrap), so a
+        direct ``self.edit_policy.sample(...)`` call ran every Linear against
+        this rank's raw, un-gathered 1-D parameter shard instead of the full
+        weight matrix.
         """
         features = torch.cat(
             [
@@ -660,9 +669,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             self._action_norm_stats,
             policy_setup=self.policy_setup,
         ).reshape(batch_size, self.action_feature_dim)
-        edit, log_prob = self.edit_policy.sample(
-            pooled_features, base_norm_flat, mode=mode
-        )
+        edit, log_prob = self.edit_policy(pooled_features, base_norm_flat, mode=mode)
         edited_norm = (base_norm_flat + edit).reshape(
             batch_size, self.num_executed_action_chunks, self.action_dim
         )
@@ -752,7 +759,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
 
         features_rep = pooled_features.repeat(num_base, 1)
         base_flat = base_candidates.reshape(num_base * batch_size, flat_dim)
-        edits, _ = self.edit_policy.sample(features_rep, base_flat, mode=mode)
+        edits, _ = self.edit_policy(features_rep, base_flat, mode=mode)
         edited_flat = base_flat + edits
 
         all_norm_flat = torch.cat([base_flat, edited_flat], dim=0)

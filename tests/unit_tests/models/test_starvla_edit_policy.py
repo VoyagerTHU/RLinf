@@ -30,11 +30,11 @@ def test_zero_init_starts_the_edit_at_exactly_zero() -> None:
     policy = _policy()
     features = torch.randn(4, 16)
     base = torch.randn(4, 12 * 29)
-    eval_edit, eval_log_prob = policy.sample(features, base, mode="eval")
+    eval_edit, eval_log_prob = policy(features, base, mode="eval")
     assert torch.equal(eval_edit, torch.zeros_like(eval_edit))
     assert eval_log_prob is None
     torch.manual_seed(0)
-    train_edit, log_prob = policy.sample(features, base, mode="train")
+    train_edit, log_prob = policy(features, base, mode="train")
     # mean_head is zero-init, so the pre-tanh mean is 0 regardless of input;
     # only the (also zero-init-weight but non-zero-bias) log_std varies the
     # sample around that.
@@ -53,7 +53,7 @@ def test_edit_is_bounded_by_beta() -> None:
     features = torch.randn(8, 16)
     base = torch.randn(8, 12 * 29)
     for mode in ("eval", "train"):
-        edit, _ = policy.sample(features, base, mode=mode)
+        edit, _ = policy(features, base, mode=mode)
         assert edit.abs().max().item() <= beta + 1e-6
 
 
@@ -63,7 +63,7 @@ def test_train_mode_log_prob_matches_a_manual_tanh_gaussian_computation() -> Non
     features = torch.randn(2, 16)
     base = torch.randn(2, 12 * 29)
     torch.manual_seed(1)
-    edit, log_prob = policy.sample(features, base, mode="train")
+    edit, log_prob = policy(features, base, mode="train")
 
     # Recompute log_prob from the edit itself: pre_tanh = atanh(edit / beta),
     # then the standard tanh-Gaussian correction. This does not reuse any of
@@ -93,5 +93,5 @@ def test_a_zero_beta_edit_policy_reduces_to_a_pure_passthrough() -> None:
     policy = _policy(beta=1e-8)
     features = torch.randn(3, 16)
     base = torch.randn(3, 12 * 29)
-    edit, _ = policy.sample(features, base, mode="train")
+    edit, _ = policy(features, base, mode="train")
     assert edit.abs().max().item() < 1e-6
