@@ -689,7 +689,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         num_candidates: Optional[int] = None,
         mode: str = "train",
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
         """Sample N base actions, edit each, execute the highest-Q candidate.
 
         The base head that produces the raw candidates is frozen throughout
@@ -728,7 +728,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         model_inputs: dict[str, Any],
         num_candidates: Optional[int] = None,
         mode: str = "train",
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
         """Shared best-of-N core, given an already-computed backbone pass.
 
         Split out of ``sac_best_of_n`` so callers that already ran the
@@ -736,6 +736,19 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         paying for a second forward pass; ``sac_best_of_n`` itself runs the
         backbone fresh for callers (the SAC critic's next-state term) that
         do not already have one.
+
+        Returns ``(selected_env_actions, selected_norm_actions, pooled_features,
+        metrics)``. Both action tensors name the SAME selected candidate, in
+        environment units and in the policy's own normalized units
+        respectively: the critic's next-state term needs environment units
+        (sac_q_forward renormalizes internally), while the rollout handler
+        needs normalized units (predict_action_batch unnormalizes the value
+        it is given exactly once). An earlier version returned only the
+        environment-unit action and the rollout handler stored it straight
+        into the "normalized_actions" field, so predict_action_batch
+        unnormalized an already-unnormalized action and every episode
+        executed a doubly-transformed action -- 0/96 grasped in the smoke
+        test that caught it.
         """
         pooled_features = self._pool_sac_features(
             last_hidden, model_inputs.get("attention_mask")
@@ -779,16 +792,20 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         )
         q_agg = all_q_values.float().min(dim=-1).values.reshape(num_groups, batch_size)
         best_group = torch.argmax(q_agg, dim=0)
-        grouped_actions = all_env_actions.reshape(
+        grouped_env_actions = all_env_actions.reshape(
+            num_groups, batch_size, self.num_executed_action_chunks, self.action_dim
+        )
+        grouped_norm_actions = all_norm_chunked.reshape(
             num_groups, batch_size, self.num_executed_action_chunks, self.action_dim
         )
         batch_index = torch.arange(batch_size, device=best_group.device)
-        selected_env_actions = grouped_actions[best_group, batch_index]
+        selected_env_actions = grouped_env_actions[best_group, batch_index]
+        selected_norm_actions = grouped_norm_actions[best_group, batch_index]
 
         metrics = {
             "frac_selected_is_edited": (best_group >= num_base).float().mean().item(),
         }
-        return selected_env_actions, pooled_features, metrics
+        return selected_env_actions, selected_norm_actions, pooled_features, metrics
 
     def default_forward(
         self,

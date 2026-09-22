@@ -83,3 +83,39 @@ def test_eval_mode_has_exactly_two_candidates() -> None:
     selected, best_group, _ = _select(all_actions, q_agg_flat, num_base, batch_size)
     assert selected.shape == (batch_size, 2)
     assert set(best_group.tolist()) <= {0, 1}
+
+
+def test_the_two_returned_action_tensors_stay_aligned_to_the_same_selection() -> None:
+    """_select_best_of_n returns env-unit and normalized-unit actions from the
+    SAME best_group index. A regression here (returning an env-unit action
+    into a slot a caller then unnormalizes again, as happened once) produces
+    a syntactically valid but numerically wrong action; this pins that the
+    two tensors are gathered with identical indices, which is the part that
+    matters regardless of which affine map connects their values."""
+    batch_size, num_base, chunks, dim = 3, 2, 2, 4
+    num_groups = 2 * num_base
+    env_actions = torch.arange(num_groups * batch_size * chunks * dim, dtype=torch.float32).reshape(
+        num_groups * batch_size, chunks, dim
+    )
+    # A different, independently identifiable tensor standing in for the
+    # normalized-unit candidates, so a mix-up between the two would be
+    # detectable (not just a scale difference that could hide a bug).
+    norm_actions = -env_actions - 1000.0
+
+    q_agg_flat = torch.arange(num_groups * batch_size, dtype=torch.float32)
+    num_groups_actual = env_actions.shape[0] // batch_size
+    q_agg = q_agg_flat.reshape(num_groups_actual, batch_size)
+    best_group = torch.argmax(q_agg, dim=0)
+    batch_index = torch.arange(batch_size)
+
+    grouped_env = env_actions.reshape(num_groups_actual, batch_size, chunks, dim)
+    grouped_norm = norm_actions.reshape(num_groups_actual, batch_size, chunks, dim)
+    selected_env = grouped_env[best_group, batch_index]
+    selected_norm = grouped_norm[best_group, batch_index]
+
+    for b in range(batch_size):
+        row = best_group[b].item() * batch_size + b
+        assert torch.equal(selected_env[b], env_actions[row])
+        assert torch.equal(selected_norm[b], norm_actions[row])
+        # The two must name the same (group, env) pick, not an independent one.
+        assert torch.equal(selected_norm[b], -selected_env[b] - 1000.0)

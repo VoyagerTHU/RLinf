@@ -216,7 +216,11 @@ def run_rollout_oft(
         # head's own resampled candidates (or their edited versions) the
         # twin Q heads currently prefer, not a plain sample from the base
         # distribution. See StarVLAForRLActionPrediction._select_best_of_n.
-        executed_actions, _, _ = policy._select_best_of_n(
+        # predict_action_batch unnormalizes whatever is stored under
+        # "normalized_actions" exactly once, so the value handed back here
+        # must be in the policy's own normalized units, not environment
+        # units (see the return-value docstring on _select_best_of_n).
+        _, executed_actions, _, _ = policy._select_best_of_n(
             mean_actions,
             last_hidden,
             dist,

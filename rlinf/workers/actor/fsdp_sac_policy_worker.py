@@ -625,7 +625,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 # edited versions, Q currently prefers -- never a plain
                 # sample from the base's own Gaussian, and never something a
                 # gradient step could have dragged off distribution.
-                next_state_actions, shared_feature, _ = self.model(
+                # The TD target's next-state Q call renormalizes internally
+                # (sac_q_forward), so it needs environment units here, not
+                # the normalized-unit selection the rollout handler uses.
+                next_state_actions, _, shared_feature, _ = self.model(
                     forward_type=ForwardType.SAC_BEST_OF_N,
                     obs=next_obs,
                     num_candidates=self.expo_num_candidates,
