@@ -210,12 +210,34 @@ def run_rollout_oft(
         use_cache=False,
     )
     sample_actions = bool(sampling_kwargs.get("do_sample")) and mode == "train"
-    executed_actions = dist.sample() if sample_actions else mean_actions
+    edit_policy = getattr(policy, "edit_policy", None)
+    if edit_policy is not None:
+        # EXPO-FT-style recipe: the executed action is whichever of the base
+        # head's own resampled candidates (or their edited versions) the
+        # twin Q heads currently prefer, not a plain sample from the base
+        # distribution. See StarVLAForRLActionPrediction._select_best_of_n.
+        executed_actions, _, _ = policy._select_best_of_n(
+            mean_actions,
+            last_hidden,
+            dist,
+            model_inputs,
+            num_candidates=policy.expo_num_candidates,
+            mode=mode,
+        )
+    else:
+        executed_actions = dist.sample() if sample_actions else mean_actions
 
     prev_logprobs = None
     prev_values = None
     if calculate_logprobs:
-        prev_logprobs = dist.log_prob(executed_actions).to(dtype=torch.float32)
+        # SAC does not consume prev_logprobs (it recomputes everything from
+        # raw replay observations); the base distribution has no meaningful
+        # density for a best-of-N pick that may not even be one of its raw
+        # samples, so this is a harmless constant placeholder that satisfies
+        # the storage contract without claiming a probability that isn't one.
+        prev_logprobs = dist.log_prob(
+            executed_actions if edit_policy is None else mean_actions
+        ).to(dtype=torch.float32)
     if calculate_values:
         prev_values = compute_values_from_hidden(
             value_head=policy.value_head,

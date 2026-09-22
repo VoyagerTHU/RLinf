@@ -21,6 +21,8 @@ class ForwardType(Enum):
     SFT = "sft"
     SAC = "sac"
     SAC_Q = "sac_q"
+    SAC_EDIT = "sac_edit"
+    SAC_BEST_OF_N = "sac_best_of_n"
     CROSSQ = "crossq"
     CROSSQ_Q = "crossq_q"
     IQL_ACTOR = "iql_actor"

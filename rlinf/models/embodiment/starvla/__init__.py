@@ -299,10 +299,15 @@ def get_model(
         add_q_head=getattr(cfg, "add_q_head", False),
         num_q_heads=getattr(cfg, "num_q_heads", 2),
         q_hidden_dims=tuple(getattr(cfg, "q_hidden_dims", (512, 256))),
+        add_edit_policy=getattr(cfg, "add_edit_policy", False),
+        edit_hidden_dims=tuple(getattr(cfg, "edit_hidden_dims", (256, 256, 256))),
+        edit_beta=float(getattr(cfg, "edit_beta", 0.1)),
+        expo_num_candidates=int(getattr(cfg, "expo_num_candidates", 8)),
         sac_task_description=getattr(cfg, "sac_task_description", None),
         value_head_zero_init=bool(getattr(cfg, "value_head_zero_init", True)),
         value_head_input_norm=getattr(cfg, "value_head_input_norm", "layer_norm"),
         action_norm_stats=_plain_container(getattr(cfg, "action_norm_stats", None)),
+        resize_images_to_train_size=getattr(cfg, "resize_images_to_train_size", None),
     )
 
 

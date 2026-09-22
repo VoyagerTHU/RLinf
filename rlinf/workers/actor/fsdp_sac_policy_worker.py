@@ -317,6 +317,19 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 "algorithm.q_action_probe_samples needs the policy's action "
                 "statistics, which this model does not expose"
             )
+        # EXPO-FT-style recipe (arXiv:2605.25477): the pretrained OFT head is
+        # frozen (excluded from actor.trainable_parameter_prefixes) and only
+        # a small residual edit policy plus the twin Q heads are trained.
+        # Detected from the model rather than a separate config flag so the
+        # actor and the model's own construction can never disagree about
+        # which recipe is active.
+        self.expo_ft_enabled = getattr(unwrap_module(self.model), "edit_policy", None) is not None
+        self.expo_num_candidates = int(
+            self.cfg.algorithm.get(
+                "expo_num_candidates",
+                getattr(unwrap_module(self.model), "expo_num_candidates", 8),
+            )
+        )
 
         self.replay_buffer = TrajectoryReplayBuffer(
             seed=seed,
@@ -606,9 +619,27 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 )
             if use_dsrl:
                 kwargs["train"] = True
-            next_state_actions, next_state_log_pi, shared_feature, _ = (
-                self._policy_forward(next_obs, **kwargs)
-            )
+            if self.expo_ft_enabled:
+                # EXPO-FT: the bootstrap action at the next state is whichever
+                # of the (frozen) base head's resampled candidates, or their
+                # edited versions, Q currently prefers -- never a plain
+                # sample from the base's own Gaussian, and never something a
+                # gradient step could have dragged off distribution.
+                next_state_actions, shared_feature, _ = self.model(
+                    forward_type=ForwardType.SAC_BEST_OF_N,
+                    obs=next_obs,
+                    num_candidates=self.expo_num_candidates,
+                    mode="train",
+                )
+                next_state_log_pi = torch.zeros(
+                    (next_state_actions.shape[0], 1),
+                    dtype=self.torch_dtype,
+                    device=self.device,
+                )
+            else:
+                next_state_actions, next_state_log_pi, shared_feature, _ = (
+                    self._policy_forward(next_obs, **kwargs)
+                )
             if next_state_log_pi.ndim == 1:
                 next_state_log_pi = next_state_log_pi.unsqueeze(-1)
             next_state_log_pi = next_state_log_pi.sum(dim=-1, keepdim=True)
@@ -745,8 +776,53 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             metrics["transition_valid_fraction"] = transition_valid.mean().item()
         return critic_loss, metrics
 
+    def _forward_actor_expo_ft(self, batch):
+        """EXPO-FT actor step: train only the residual edit policy.
+
+        The pretrained OFT head never receives a gradient in this recipe (it
+        is excluded from actor.trainable_parameter_prefixes), so unlike the
+        anchor-based path below there is no drift to bound or measure -- the
+        base action literally cannot move.
+        """
+        if "actor_agg_q" in self.cfg.algorithm:
+            agg_q = self.cfg.algorithm["actor_agg_q"]
+        else:
+            agg_q = self.cfg.algorithm.get("agg_q", "min")
+
+        curr_obs = batch["curr_obs"]
+        edited_actions, edit_log_pi, shared_feature, extras = self.model(
+            forward_type=ForwardType.SAC_EDIT,
+            obs=curr_obs,
+            base_actions=batch["actions"],
+            mode="train",
+        )
+        all_qf_pi = self.model(
+            forward_type=ForwardType.SAC_Q,
+            obs=curr_obs,
+            actions=edited_actions,
+            shared_feature=shared_feature,
+            detach_encoder=True,
+        )
+        metrics = {
+            f"q_value_{q_id}": all_qf_pi[..., q_id].mean().item()
+            for q_id in range(self.cfg.actor.model.get("num_q_heads", 2))
+        }
+        if agg_q == "min":
+            qf_pi, _ = torch.min(all_qf_pi, dim=1, keepdim=True)
+        elif agg_q == "mean":
+            qf_pi = torch.mean(all_qf_pi, dim=1, keepdim=True)
+        metrics["q_pi"] = qf_pi.mean().item()
+        transition_valid = batch.get(TRANSITION_VALID_KEY)
+        objective = (self.entropy_temp.alpha * edit_log_pi) - qf_pi
+        actor_loss = masked_transition_mean(objective, transition_valid)
+        entropy = -edit_log_pi.mean()
+        metrics["edit_magnitude"] = extras["edit"].abs().mean().item()
+        return actor_loss, entropy, metrics
+
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
+        if self.expo_ft_enabled:
+            return self._forward_actor_expo_ft(batch)
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
         if "actor_agg_q" in self.cfg.algorithm:
             agg_q = self.cfg.algorithm["actor_agg_q"]
@@ -856,17 +932,25 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
     def forward_alpha(self, batch):
         curr_obs = batch["curr_obs"]
         with torch.no_grad():
-            kwargs = {}
-            if self.cfg.actor.model.model_type in ["openvla", "openvla_oft"]:
-                kwargs["temperature"] = (
-                    self.cfg.algorithm.sampling_params.temperature_train
+            if self.expo_ft_enabled:
+                _, log_pi, _, _ = self.model(
+                    forward_type=ForwardType.SAC_EDIT,
+                    obs=curr_obs,
+                    base_actions=batch["actions"],
+                    mode="train",
                 )
-            if self.use_dsrl:
-                kwargs["train"] = True
-            _, log_pi, _, _ = self._policy_forward(curr_obs, **kwargs)
-            if log_pi.ndim == 1:
-                log_pi = log_pi.unsqueeze(-1)
-            log_pi = log_pi.sum(dim=-1, keepdim=True)
+            else:
+                kwargs = {}
+                if self.cfg.actor.model.model_type in ["openvla", "openvla_oft"]:
+                    kwargs["temperature"] = (
+                        self.cfg.algorithm.sampling_params.temperature_train
+                    )
+                if self.use_dsrl:
+                    kwargs["train"] = True
+                _, log_pi, _, _ = self._policy_forward(curr_obs, **kwargs)
+                if log_pi.ndim == 1:
+                    log_pi = log_pi.unsqueeze(-1)
+                log_pi = log_pi.sum(dim=-1, keepdim=True)
 
         alpha = self.entropy_temp.compute_alpha()
         alpha_loss = -alpha * (log_pi.mean() + self.target_entropy)

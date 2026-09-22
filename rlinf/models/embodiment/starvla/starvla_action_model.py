@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import warnings
 from functools import partial
 from typing import Any, Optional
@@ -127,6 +128,100 @@ class StarVLAMultiQHead(MultiQHead):
         return super().forward(normalized, action_features)
 
 
+class StarVLAEditPolicy(nn.Module):
+    """Lightweight residual actor for EXPO-FT-style SAC fine-tuning.
+
+    Maps (pooled state features, a candidate action in normalized units) to a
+    small additive correction bounded to ``[-beta, beta]`` per channel. This
+    module and the twin Q heads are the only parameters an EXPO-FT recipe
+    trains with RL; the pretrained OFT head that generates candidate actions
+    is frozen throughout, so nothing here can drift the pretrained policy the
+    way a directly-trained actor mean can (see attempts 9-12 in
+    SAC_SUMMARY.md). Reference: Dong et al., "EXPO-FT" (arXiv:2605.25477),
+    which does the same thing on top of a pi0.5 flow-matching base; ours sits
+    on top of a deterministic point-regression base instead, so the diversity
+    among candidates in ``sac_best_of_n`` below comes entirely from resampling
+    the base head's own fixed-variance Gaussian, not from an inherently
+    multimodal generator.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        action_feature_dim: int,
+        hidden_dims: tuple[int, ...],
+        beta: float,
+        input_norm: bool = True,
+    ) -> None:
+        super().__init__()
+        self.beta = float(beta)
+        self.action_feature_dim = int(action_feature_dim)
+        self.state_norm: nn.Module = (
+            nn.LayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
+            if input_norm
+            else nn.Identity()
+        )
+        layers: list[nn.Module] = []
+        prev_dim = hidden_size + self.action_feature_dim
+        for hidden_dim in hidden_dims:
+            layers += [
+                nn.Linear(prev_dim, int(hidden_dim)),
+                nn.LayerNorm(int(hidden_dim)),
+                nn.ReLU(),
+            ]
+            prev_dim = int(hidden_dim)
+        self.trunk: nn.Module = nn.Sequential(*layers) if layers else nn.Identity()
+        self.mean_head = nn.Linear(prev_dim, self.action_feature_dim)
+        self.log_std_head = nn.Linear(prev_dim, self.action_feature_dim)
+        # Zero-init the mean head so the edit starts at exactly 0
+        # (tanh(0) = 0): training begins with the pretrained policy's
+        # behaviour unchanged, and only moves it once Q says to.
+        nn.init.zeros_(self.mean_head.weight)
+        nn.init.zeros_(self.mean_head.bias)
+        nn.init.zeros_(self.log_std_head.weight)
+        nn.init.constant_(self.log_std_head.bias, -1.0)
+
+    def sample(
+        self,
+        state_features: torch.Tensor,
+        base_action_flat: torch.Tensor,
+        mode: str = "train",
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Sample (or take the mode of) the edit distribution.
+
+        Returns ``(edit, log_prob)`` in normalized action units, both flat
+        over the chunk/dim axes like ``base_action_flat``. ``log_prob`` is
+        ``None`` in eval mode (the edit is then the deterministic mode).
+        """
+        features = torch.cat(
+            [
+                self.state_norm(state_features.float()),
+                base_action_flat.float(),
+            ],
+            dim=-1,
+        )
+        hidden = self.trunk(features)
+        mean = self.mean_head(hidden)
+        if mode == "eval":
+            return self.beta * torch.tanh(mean), None
+        log_std = self.log_std_head(hidden).clamp(-5.0, 2.0)
+        std = log_std.exp()
+        pre_tanh = mean + std * torch.randn_like(mean)
+        tanh_pre = torch.tanh(pre_tanh)
+        edit = self.beta * tanh_pre
+        # Standard SAC tanh-squash log-density, adjusted for the extra beta
+        # scale factor: log p(edit) = log N(pre_tanh) - log|d edit/d pre_tanh|
+        # = log N(pre_tanh) - sum[log(beta) + log(1 - tanh(pre_tanh)^2)].
+        gaussian_log_prob = (
+            -0.5
+            * (((pre_tanh - mean) / std) ** 2 + 2.0 * log_std + math.log(2.0 * math.pi))
+        ).sum(dim=-1, keepdim=True)
+        squash_correction = (
+            math.log(self.beta) + torch.log1p(-tanh_pre.pow(2) + 1e-6)
+        ).sum(dim=-1, keepdim=True)
+        return edit, gaussian_log_prob - squash_correction
+
+
 class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
     """RLinf policy wrapper for starVLA checkpoints.
 
@@ -157,10 +252,15 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         add_q_head: bool = False,
         num_q_heads: int = 2,
         q_hidden_dims: tuple[int, ...] = (512, 256),
+        add_edit_policy: bool = False,
+        edit_hidden_dims: tuple[int, ...] = (256, 256, 256),
+        edit_beta: float = 0.1,
+        expo_num_candidates: int = 8,
         sac_task_description: Optional[str] = None,
         value_head_zero_init: bool = True,
         value_head_input_norm: Optional[str] = "layer_norm",
         action_norm_stats: Optional[Any] = None,
+        resize_images_to_train_size: Optional[bool] = None,
     ):
         super().__init__()
 
@@ -188,6 +288,14 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         self.action_stats_source = str(action_stats_source)
         self.enable_state_input = bool(enable_state_input)
         self.policy_setup = str(policy_setup).strip().lower() if policy_setup else None
+        # Resize env images to the checkpoint's training size with cv2
+        # INTER_AREA (as StarVLA's own eval interfaces do). Legacy default:
+        # only the GR1 setup resized; other setups opt in per config.
+        self.resize_env_images = (
+            self.policy_setup == "gr1"
+            if resize_images_to_train_size is None
+            else bool(resize_images_to_train_size)
+        )
 
         # 2) Action unnormalization stats (strict: required when unnorm_key is set).
         self._action_norm_stats = action_space_utils.resolve_action_norm_stats(
@@ -213,7 +321,9 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
 
         # 5) RL heads/params (optional value head + Gaussian log-std).
         hidden_size = (
-            infer_hidden_size(starvla_model) if add_value_head or add_q_head else None
+            infer_hidden_size(starvla_model)
+            if add_value_head or add_q_head or add_edit_policy
+            else None
         )
         self.value_head: Optional[nn.Module] = None
         if add_value_head:
@@ -227,9 +337,10 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
                 zero_init=value_head_zero_init,
             )
 
+        self.action_feature_dim = self.num_executed_action_chunks * self.action_dim
         self.q_head: Optional[nn.Module] = None
         if add_q_head:
-            action_feature_dim = self.num_executed_action_chunks * self.action_dim
+            action_feature_dim = self.action_feature_dim
             self.q_head = StarVLAMultiQHead(
                 hidden_size=hidden_size,
                 action_feature_dim=action_feature_dim,
@@ -252,6 +363,22 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             self.reference_action_model = copy.deepcopy(starvla_model.action_model)
             self.reference_action_model.requires_grad_(False)
             self.reference_action_model.eval()
+        # EXPO-FT-style residual actor (Dong et al., arXiv:2605.25477). Needs
+        # the twin Q heads to pick among candidates in sac_best_of_n, so it
+        # requires add_q_head too.
+        self.expo_num_candidates = int(expo_num_candidates)
+        self.edit_policy: Optional[nn.Module] = None
+        if add_edit_policy:
+            if not add_q_head:
+                raise ValueError(
+                    "actor.model.add_edit_policy=true requires add_q_head=true"
+                )
+            self.edit_policy = StarVLAEditPolicy(
+                hidden_size=hidden_size,
+                action_feature_dim=self.action_feature_dim,
+                hidden_dims=[int(dim) for dim in edit_hidden_dims],
+                beta=edit_beta,
+            ).to(dtype=torch.float32)
         self.sac_task_description = (
             None if sac_task_description is None else str(sac_task_description).strip()
         )
@@ -356,6 +483,10 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             return self.sac_forward(**kwargs)
         if forward_type == ForwardType.SAC_Q:
             return self.sac_q_forward(**kwargs)
+        if forward_type == ForwardType.SAC_EDIT:
+            return self.sac_edit_forward(**kwargs)
+        if forward_type == ForwardType.SAC_BEST_OF_N:
+            return self.sac_best_of_n(**kwargs)
         raise NotImplementedError(f"Unsupported forward_type: {forward_type}")
 
     def _run_sac_oft_policy(
@@ -380,7 +511,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             batch_size = int(sac_obs["main_images"].shape[0])
             sac_obs["task_descriptions"] = [self.sac_task_description] * batch_size
 
-        if self.policy_setup == "gr1":
+        if self.resize_env_images:
             from .utils.vlm_preprocess import get_train_image_size
 
             target_size = get_train_image_size(self.starvla_model)
@@ -406,12 +537,10 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             num_action_chunks=self.num_action_chunks,
             examples=examples,
         )
-        mean_actions, last_hidden, dist, action_queries = (
-            _run_oft_backbone_and_head(
-                self,
-                model_inputs=model_inputs,
-                use_cache=False,
-            )
+        mean_actions, last_hidden, dist, action_queries = _run_oft_backbone_and_head(
+            self,
+            model_inputs=model_inputs,
+            use_cache=False,
         )
         return mean_actions, last_hidden, dist, model_inputs, action_queries
 
@@ -500,6 +629,160 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         q_dtype = next(self.q_head.parameters()).dtype
         return self.q_head(shared_feature.to(dtype=q_dtype), actions.to(dtype=q_dtype))
 
+    def sac_edit_forward(
+        self,
+        obs: dict[str, Any],
+        base_actions: torch.Tensor,
+        mode: str = "train",
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """EXPO-FT actor step: edit an already-executed action, base frozen.
+
+        ``base_actions`` is the replay-stored executed action, in environment
+        units, in either layout ([B, chunks, dim] or the buffer's flattened
+        [B, chunks*dim]). Returns
+        ``(edited_env_actions, log_prob, pooled_features, extras)``; ``log_prob``
+        is zero in eval mode and ``extras["edit"]`` is the raw normalized-space
+        correction, for diagnostics.
+        """
+        del kwargs
+        if self.edit_policy is None:
+            raise RuntimeError(
+                "sac_edit_forward requires actor.model.add_edit_policy=true"
+            )
+        _, last_hidden, _, model_inputs, _ = self._run_sac_oft_policy(obs)
+        pooled_features = self._pool_sac_features(
+            last_hidden, model_inputs.get("attention_mask")
+        )
+        batch_size = base_actions.shape[0]
+        base_norm_flat = action_space_utils.normalize_actions_from_env_torch(
+            base_actions.reshape(batch_size, -1, self.action_dim),
+            self._action_norm_stats,
+            policy_setup=self.policy_setup,
+        ).reshape(batch_size, self.action_feature_dim)
+        edit, log_prob = self.edit_policy.sample(
+            pooled_features, base_norm_flat, mode=mode
+        )
+        edited_norm = (base_norm_flat + edit).reshape(
+            batch_size, self.num_executed_action_chunks, self.action_dim
+        )
+        edited_env_actions = action_space_utils.unnormalize_actions_for_env_torch(
+            edited_norm, self._action_norm_stats, policy_setup=self.policy_setup
+        )
+        if log_prob is None:
+            log_prob = torch.zeros(
+                (batch_size, 1), dtype=torch.float32, device=base_actions.device
+            )
+        extras = {"edit": edit.detach()}
+        return edited_env_actions, log_prob.to(torch.float32), pooled_features, extras
+
+    def sac_best_of_n(
+        self,
+        obs: dict[str, Any],
+        num_candidates: Optional[int] = None,
+        mode: str = "train",
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+        """Sample N base actions, edit each, execute the highest-Q candidate.
+
+        The base head that produces the raw candidates is frozen throughout
+        an EXPO-FT recipe, so resampling it N times never drifts the
+        pretrained policy; training can only change which candidate gets
+        picked (by shaping Q) and how the edit head reshapes each one. Used
+        both to act during rollout and to pick the bootstrap action at the
+        next state in the critic's TD target. In eval mode this collapses to
+        exactly two deterministic candidates -- the pretrained mean and its
+        deterministically edited version -- so official evaluation stays
+        reproducible per seed.
+        """
+        del kwargs
+        if self.edit_policy is None or self.q_head is None:
+            raise RuntimeError(
+                "sac_best_of_n requires actor.model.add_edit_policy=true and "
+                "add_q_head=true"
+            )
+        mean_actions, last_hidden, dist, model_inputs, _ = self._run_sac_oft_policy(
+            obs
+        )
+        return self._select_best_of_n(
+            mean_actions,
+            last_hidden,
+            dist,
+            model_inputs,
+            num_candidates=num_candidates,
+            mode=mode,
+        )
+
+    def _select_best_of_n(
+        self,
+        mean_actions: torch.Tensor,
+        last_hidden: torch.Tensor,
+        dist: torch.distributions.Normal,
+        model_inputs: dict[str, Any],
+        num_candidates: Optional[int] = None,
+        mode: str = "train",
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+        """Shared best-of-N core, given an already-computed backbone pass.
+
+        Split out of ``sac_best_of_n`` so callers that already ran the
+        backbone this step (the OFT rollout handler) can select without
+        paying for a second forward pass; ``sac_best_of_n`` itself runs the
+        backbone fresh for callers (the SAC critic's next-state term) that
+        do not already have one.
+        """
+        pooled_features = self._pool_sac_features(
+            last_hidden, model_inputs.get("attention_mask")
+        )
+        batch_size = mean_actions.shape[0]
+        flat_dim = self.action_feature_dim
+
+        if mode == "eval":
+            base_candidates = mean_actions.reshape(1, batch_size, flat_dim)
+        else:
+            n = int(num_candidates or self.expo_num_candidates)
+            # The candidates are never trained: this base head has no RL
+            # gradient path (it is excluded from actor.trainable_parameter_prefixes),
+            # so nothing upstream of these samples needs a graph. Detaching
+            # is a defensive no-op that keeps it that way even if that
+            # changes.
+            base_candidates = (
+                dist.rsample((n,)).detach().reshape(n, batch_size, flat_dim)
+            )
+        num_base = base_candidates.shape[0]
+
+        features_rep = pooled_features.repeat(num_base, 1)
+        base_flat = base_candidates.reshape(num_base * batch_size, flat_dim)
+        edits, _ = self.edit_policy.sample(features_rep, base_flat, mode=mode)
+        edited_flat = base_flat + edits
+
+        all_norm_flat = torch.cat([base_flat, edited_flat], dim=0)
+        all_norm_chunked = all_norm_flat.reshape(
+            -1, self.num_executed_action_chunks, self.action_dim
+        )
+        all_env_actions = action_space_utils.unnormalize_actions_for_env_torch(
+            all_norm_chunked, self._action_norm_stats, policy_setup=self.policy_setup
+        )
+        num_groups = all_env_actions.shape[0] // batch_size
+        features_all = pooled_features.repeat(num_groups, 1)
+        all_q_values = self.sac_q_forward(
+            obs=None,
+            actions=all_env_actions,
+            shared_feature=features_all,
+            detach_encoder=True,
+        )
+        q_agg = all_q_values.float().min(dim=-1).values.reshape(num_groups, batch_size)
+        best_group = torch.argmax(q_agg, dim=0)
+        grouped_actions = all_env_actions.reshape(
+            num_groups, batch_size, self.num_executed_action_chunks, self.action_dim
+        )
+        batch_index = torch.arange(batch_size, device=best_group.device)
+        selected_env_actions = grouped_actions[best_group, batch_index]
+
+        metrics = {
+            "frac_selected_is_edited": (best_group >= num_base).float().mean().item(),
+        }
+        return selected_env_actions, pooled_features, metrics
+
     def default_forward(
         self,
         forward_inputs: Optional[dict[str, torch.Tensor]] = None,
@@ -585,7 +868,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             calculate_values = False
         self._check_sac_task_description(env_obs)
 
-        if self.policy_setup == "gr1":
+        if self.resize_env_images:
             from .utils.vlm_preprocess import get_train_image_size
 
             target_size = get_train_image_size(self.starvla_model)

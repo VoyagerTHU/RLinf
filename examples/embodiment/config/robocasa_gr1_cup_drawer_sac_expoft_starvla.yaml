@@ -1,0 +1,340 @@
+defaults:
+  - env/robocasa_gr1_cup_drawer@env.train
+  - env/robocasa_gr1_cup_drawer@env.eval
+  - model/starvla@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,rollout: ${oc.env:ROBOCASA_GR1_ACTOR_ROLLOUT_PLACEMENT,4-7}
+    env: ${oc.env:ROBOCASA_GR1_ENV_PLACEMENT,4-7}
+
+runner:
+  task_type: embodied
+  weight_sync_interval: 1
+  logger:
+    log_path: ${oc.env:ROBOCASA_GR1_SAC_EXPOFT_LOG_ROOT,/data/dengyixuan/wyz/experiments/rlinf_starvla_robocasa_gr1_sac_expoft}
+    project_name: rlinf-starvla-robocasa-gr1
+    experiment_name: cup_to_drawer_close_sac_expoft
+    # No remote backend; every step is persisted to metrics/*.jsonl.
+    logger_backends: []
+  max_epochs: 120
+  max_steps: 120
+  only_eval: false
+  # Evaluate on the fixed 50 official seeds so the run is comparable with the
+  # GRPO (0.68) and PPO (0.70) results on this task.
+  val_check_interval: 5
+  save_interval: 10
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  normalize_advantages: false
+  group_size: 1
+  reward_coef: 1.0
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: chunk_level
+  adv_type: embodied_sac
+  loss_type: embodied_sac
+  loss_agg_func: token-mean
+  # Critic updates per rollout step. Each step adds 32 envs x 60 chunks = 1920
+  # transitions; 8 updates x 256 samples give an update-to-data ratio of ~1.
+  # The earlier value of 2 (UTD ~0.27, 120 critic steps in 60 rollouts) never
+  # let the twin Q fit the sparse bootstrap target (q_data stayed ~0.01).
+  update_epoch: 8
+
+  # Each policy call executes 12 physical actions. The SAC worker raises this
+  # per-action discount to the executed horizon for its one-step Q target.
+  # 0.999 per physical control step becomes ~0.988 per 12-action chunk. Using
+  # 0.99 here would become 0.886 per chunk and nearly erase a sparse terminal
+  # reward across a RoboCasa episode.
+  gamma: 0.999
+  # Value has to travel back 60 chunks to reach the start of an episode, and a
+  # target network with tau 0.005 only tracks the online critic over ~200
+  # updates, so the sparse-reward run needed ~1500 rollout steps to propagate
+  # it and collapsed at 82. Milestone shaping (below) removes most of that
+  # distance; tau 0.02 covers the rest.
+  tau: 0.02
+  target_update_freq: 1
+  target_update_type: q_head_only
+  lightweight_starvla_checkpoint: true
+  bootstrap_type: standard
+  backup_entropy: false
+  agg_q: min
+  actor_agg_q: min
+  q_head_type: default
+  critic_subsample_size: -1
+  critic_actor_ratio: 2
+  # Rollout steps of critic-only warmup before the actor may move. The previous
+  # value of 2 let the actor follow dQ/da while Q was still a constant.
+  train_actor_steps: 30
+  # Hard gate on top of that warmup: the actor trains only while the critic
+  # discriminates, measured as the batch-wise standard deviation of Q. The
+  # collapsed run predicted ~0.011 for every sample (std ~0); with milestone
+  # rewards in [0, 1] a spread of 0.05 is a low bar that a working critic
+  # clears and a collapsed one never does.
+  min_q_std_for_actor: 0.05
+  # q_data_std is a spread over states; a critic that learned only V(s) passes
+  # it while its dQ/da is noise, which is what attempts 3-8 ran the actor on.
+  # This probe evaluates Q at q_action_probe_samples actions around the policy
+  # mean (at q_action_probe_sigma_scale exploration sigmas) on the same state
+  # and reports their spread as critic/q_action_std, plus Q at the policy
+  # mean, the frozen pretrained mean and the replay action. The ratio gate
+  # requires that spread to be a fraction of the across-state spread before the
+  # actor trains; 0 would leave it as a diagnostic. The smoke test measured
+  # ~0.014 for a critic after 8-16 updates, so 0.01 only blocks the case where
+  # the action pathway falls behind the state pathway as the critic trains,
+  # i.e. a critic that became V(s).
+  q_action_probe_samples: 4
+  q_action_probe_sigma_scale: 1.0
+  min_q_action_ratio_for_actor: 0.01
+  # Chunk return sum_i gamma^i r_i, consistent with the gamma^12 bootstrap.
+  discount_within_chunk: true
+  # EXPO-FT (arXiv:2605.25477) recipe: the pretrained OFT head that generates
+  # candidate actions is frozen (actor.trainable_parameter_prefixes below
+  # excludes it), so unlike attempts 9-11 there is no drift to anchor or
+  # measure -- the base action cannot move regardless of what the critic
+  # thinks. bc_coef is 0 (no anchor: nothing to anchor).
+  bc_coef: 0.0
+  # Candidates evaluated per state for best-of-N action selection, used both
+  # to act during rollout and to pick the bootstrap action at the next state
+  # (see StarVLAForRLActionPrediction.sac_best_of_n). The paper uses 8.
+  expo_num_candidates: 8
+  enable_drq: false
+
+  entropy_tuning:
+    # Exploration is the same fixed logstd=-3.5 used in the GRPO/PPO runs.
+    # A fixed, small alpha avoids an ill-scaled automatic target over the
+    # 12x29-dimensional action chunk during this first SAC experiment.
+    alpha_type: fixed_alpha
+    initial_alpha: 0.001
+    optim:
+      lr: 1.0e-4
+      lr_scheduler: torch_constant
+      clip_grad: 10.0
+
+  replay_buffer:
+    enable_cache: true
+    # The sampling window is a sliding window over rollout steps (one
+    # trajectory object per env-worker stage per step). 60 steps hold every
+    # transition of a full 60-step run (~190 MB per step per rank in RAM).
+    cache_size: 60
+    sample_window_size: 60
+    min_buffer_size: 1
+    auto_save: false
+
+  sampling_params:
+    do_sample: true
+    temperature_train: 1.0
+    temperature_eval: 1.0
+    top_k: 0
+    top_p: 1.0
+    repetition_penalty: 1.0
+    add_BOS: false
+  length_params:
+    max_new_token: 256
+    max_length: 1024
+    min_length: 1
+
+env:
+  group_name: EnvGroup
+  enable_offload: false
+  train:
+    total_num_envs: 32
+    group_size: 1
+    auto_reset: false
+    ignore_terminations: false
+    seed_manifest: /data/dengyixuan/wyz/experiments/rlinf_starvla_robocasa_gr1_ppo_officialbase_actionhead_valuehead_train50_disjoint_eval5_logstdm35_r128_mb4_lr1e6_vlr1e4_klpenalty_notarget_20260827/train_seed_manifest.json
+    seed_pool_size: 50
+    seed_sampler_seed: 20260820
+    reward_coef: ${algorithm.reward_coef}
+    # The collapsed run's root cause: with binary success the critic only ever
+    # saw ~0.01 of immediate reward per chunk and had to bootstrap value back
+    # 60 chunks, which the target network could not do in the run's lifetime.
+    # Task-general milestone shaping pays each stage where it happens, so the
+    # critic has a local target everywhere. zero_potential_at_episode_end is
+    # false because a bootstrapping critic must not be taught that completed
+    # states are worth -Phi.
+    subtask_reward_shaping:
+      enabled: true
+      mode: task_general
+      coef: 1.0
+      zero_potential_at_episode_end: false
+      # Success terminates the episode, so its potential is zeroed there; the
+      # bootstrap is cut on the same signal.
+      zero_potential_at_termination: true
+      # Required whenever the terminal potential is not zeroed: the invariance
+      # theorem is about gamma * Phi(s') - Phi(s). Matches algorithm.gamma,
+      # which is per environment step.
+      gamma: 0.999
+      grasped: 0.2
+      placed: 0.5
+      released: 0.7
+      success: 1.0
+    renderer_backend: nvidia
+    llvmpipe_threads: null
+    action_steps_per_chunk: 12
+    max_episode_steps: 720
+    max_steps_per_rollout_epoch: 720
+    video_cfg:
+      save_video: true
+      info_on_video: true
+      fps: 20
+      extra_info_on_video:
+        - episode.success_once
+        - episode.grasped_once
+        - episode.obj_in_drawer_once
+        - episode.sample_seed
+      video_base_dir: ${runner.logger.log_path}/video/train
+  eval:
+    total_num_envs: 56
+    group_size: 1
+    is_eval: true
+    seed_manifest: ${oc.env:REPO_PATH}/examples/embodiment/config/seeds/robocasa_gr1_cup_drawer_eval_50.json
+    seed_pool_size: 50
+    eval_seed_count: 50
+    action_steps_per_chunk: 12
+    max_episode_steps: 720
+    max_steps_per_rollout_epoch: 720
+    renderer_backend: mesa
+    mesa_egl_device: 8
+    llvmpipe_threads: 1
+    video_cfg:
+      save_video: true
+      info_on_video: true
+      fps: 20
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: RolloutGroup
+  generation_backend: huggingface
+  training_sampling_seed: 20260824
+  recompute_logprobs: false
+  unnorm_key: ${actor.model.unnorm_key}
+  enable_offload: false
+  pipeline_stage_num: 1
+  inference_micro_batch_size: 4
+  collect_transitions: true
+  collect_prev_infos: false
+  model:
+    model_path: ${actor.model.model_path}
+    precision: ${actor.model.precision}
+
+weight_syncer:
+  patch:
+    init_sync:
+      enabled: true
+      # edit_policy and q_head are freshly initialized independently on
+      # the actor and rollout processes (different RNG per Ray worker),
+      # so rollout's copy needs an explicit first sync to match the
+      # actor's; the per-step patch sync (weight_sync_interval: 1) keeps
+      # them matched afterward. Both now act during rollout (best-of-N
+      # selection), unlike the old anchor-based recipe where q_head was
+      # rollout-invisible.
+      prefixes: [starvla_model.action_model, actor_logstd, q_head, edit_policy]
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  # The base head is frozen: it is excluded here, so the FSDP whitelist
+  # sets requires_grad=False on all its parameters. Only the twin Q heads
+  # and the new residual edit policy train.
+  trainable_parameter_prefixes: [q_head, edit_policy]
+  micro_batch_size: 4
+  global_batch_size: 256
+  seed: 42
+  enable_offload: false
+  model:
+    model_path: /data/dengyixuan/wyz/models/StarVLA/Qwen3-VL-OFT-Robocasa/checkpoints/steps_90000_pytorch_model.pt
+    model_type: starvla
+    precision: bf16
+    action_model_precision: fp32
+    action_dim: 29
+    num_action_chunks: 16
+    num_executed_action_chunks: 12
+    rollout_prompt_seq_len: 155
+    num_steps: 16
+    policy_setup: gr1
+    unnorm_key: gr1
+    action_stats_source: minmax
+    add_value_head: false
+    add_q_head: true
+    num_q_heads: 2
+    q_hidden_dims: [512, 256]
+    # EXPO-FT residual actor. Conditions on pooled state features plus a
+    # candidate action (in normalized units) and outputs a tanh-bounded
+    # additive correction; trained by SAC while the base head above is
+    # frozen. edit_beta bounds |correction| per channel in normalized
+    # units (paper uses 0.05-0.2 depending on task).
+    add_edit_policy: true
+    edit_hidden_dims: [256, 256, 256]
+    edit_beta: 0.1
+    # Replay storage keeps tensors only, so actor/critic forwards rebuild the
+    # prompt from this string. It MUST equal the instruction RoboCasa emits
+    # (robosuite gymnasium_groot: "unlocked_waist: " + ep_meta["lang"], with
+    # ep_meta["lang"] = "pick up the cup, place it into the drawer and close the
+    # drawer" for PnPCupToDrawerClose). The rollout policy raises on mismatch.
+    sac_task_description: "unlocked_waist: pick up the cup, place it into the drawer and close the drawer"
+    # 0.06 in exploration sigma (attempts 10-12), not the SFT default of
+    # -3.5 (sigma 0.03): best-of-N needs the N raw candidates it resamples
+    # from this same distribution to actually differ from one another.
+    initial_logstd: -2.8
+    trainable_logstd: false
+    use_proprio: false
+    starvla:
+      ckpt_path: ${actor.model.model_path}
+      framework_name: QwenOFT
+      expected_action_dim: ${actor.model.action_dim}
+      expected_num_action_chunks: ${actor.model.num_action_chunks}
+      expected_image_size: [224, 224]
+      enable_state_input: false
+  optim:
+    # edit_policy is a small, freshly-initialized network, not the large
+    # pretrained head this lr was tuned for; matches the paper's own
+    # actor/critic learning rate.
+    lr: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-5
+    weight_decay: 0.0
+    clip_grad: 2.0
+    lr_scheduler: constant
+  critic_optim:
+    lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-5
+    weight_decay: 0.0
+    clip_grad: 10.0
+    lr_scheduler: constant
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: full_shard
+    use_orig_params: true
+    gradient_checkpointing: false
+    mixed_precision:
+      param_dtype: null
+      reduce_dtype: null
+      buffer_dtype: null
+    wrap_policy:
+      module_classes_to_wrap: [L1RegressionActionHead, StarVLAMultiQHead, StarVLAEditPolicy]
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false
