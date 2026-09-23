@@ -110,10 +110,6 @@ algorithm:
   # measure -- the base action cannot move regardless of what the critic
   # thinks. bc_coef is 0 (no anchor: nothing to anchor).
   bc_coef: 0.0
-  # Candidates evaluated per state for best-of-N action selection, used both
-  # to act during rollout and to pick the bootstrap action at the next state
-  # (see StarVLAForRLActionPrediction.sac_best_of_n). The paper uses 8.
-  expo_num_candidates: 8
   enable_drq: false
 
   entropy_tuning:
@@ -283,6 +279,12 @@ actor:
     add_edit_policy: true
     edit_hidden_dims: [256, 256, 256]
     edit_beta: 0.1
+    # Candidates evaluated per state for best-of-N action selection, used both
+    # to act during rollout and to pick the bootstrap action at the next
+    # state (see StarVLAForRLActionPrediction.sac_best_of_n). The paper uses
+    # 8. Lives here, not under algorithm, because the rollout handler reads
+    # it off the model; the critic reads the same attribute.
+    expo_num_candidates: 8
     # Replay storage keeps tensors only, so actor/critic forwards rebuild the
     # prompt from this string. It MUST equal the instruction RoboCasa emits
     # (robosuite gymnasium_groot: "unlocked_waist: " + ep_meta["lang"], with

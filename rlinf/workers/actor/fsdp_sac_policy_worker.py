@@ -324,12 +324,40 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         # actor and the model's own construction can never disagree about
         # which recipe is active.
         self.expo_ft_enabled = getattr(unwrap_module(self.model), "edit_policy", None) is not None
+        # Single source of truth: the model attribute (actor.model.expo_num_candidates)
+        # is what the rollout handler reads, so the critic reads the same one.
         self.expo_num_candidates = int(
-            self.cfg.algorithm.get(
-                "expo_num_candidates",
-                getattr(unwrap_module(self.model), "expo_num_candidates", 8),
-            )
+            getattr(unwrap_module(self.model), "expo_num_candidates", 8)
         )
+        if self.expo_ft_enabled:
+            if "expo_num_candidates" in self.cfg.algorithm:
+                raise ValueError(
+                    "algorithm.expo_num_candidates is not read; set "
+                    "actor.model.expo_num_candidates instead (rollout and the "
+                    "critic must agree on the candidate count)"
+                )
+            if self.cfg.algorithm.loss_type != "embodied_sac":
+                raise ValueError(
+                    "actor.model.add_edit_policy=true needs "
+                    "algorithm.loss_type=embodied_sac: the rollout stores a "
+                    "placeholder prev_logprobs for best-of-N picks that has no "
+                    "meaning as an importance ratio"
+                )
+            if self.cfg.rollout.get("recompute_logprobs", False):
+                raise ValueError(
+                    "actor.model.add_edit_policy=true is incompatible with "
+                    "rollout.recompute_logprobs=true (see loss_type note)"
+                )
+            alpha_type = self.cfg.algorithm.entropy_tuning.get("alpha_type", "fixed_alpha")
+            if alpha_type != "fixed_alpha":
+                raise ValueError(
+                    "actor.model.add_edit_policy=true needs "
+                    "algorithm.entropy_tuning.alpha_type=fixed_alpha: the "
+                    "tanh/beta-squashed edit log-prob carries a -sum(log beta) "
+                    "offset and a bounded entropy that the default "
+                    "target_entropy can never reach, so automatic tuning drives "
+                    f"alpha without bound (got {alpha_type!r})"
+                )
 
         self.replay_buffer = TrajectoryReplayBuffer(
             seed=seed,
@@ -619,6 +647,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 )
             if use_dsrl:
                 kwargs["train"] = True
+            next_selection_metrics = {}
             if self.expo_ft_enabled and bool(
                 unwrap_module(self.model).critic_gate_open.item()
             ):
@@ -634,20 +663,29 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 # The TD target's next-state Q call renormalizes internally
                 # (sac_q_forward), so it needs environment units here, not
                 # the normalized-unit selection the rollout handler uses.
-                next_state_actions, _, shared_feature, _ = self.model(
-                    forward_type=ForwardType.SAC_BEST_OF_N,
-                    obs=next_obs,
-                    num_candidates=self.expo_num_candidates,
-                    mode="train",
-                )
-                next_state_log_pi = torch.zeros(
-                    (next_state_actions.shape[0], 1),
-                    dtype=self.torch_dtype,
-                    device=self.device,
+                next_state_actions, _, shared_feature, next_selection_metrics = (
+                    self.model(
+                        forward_type=ForwardType.SAC_BEST_OF_N,
+                        obs=next_obs,
+                        num_candidates=self.expo_num_candidates,
+                        mode="train",
+                    )
                 )
             else:
                 next_state_actions, next_state_log_pi, shared_feature, _ = (
                     self._policy_forward(next_obs, **kwargs)
+                )
+            if self.expo_ft_enabled:
+                # The deployed policy under EXPO-FT is a best-of-N pick (or,
+                # before the gate opens, a plain base sample that the actor
+                # never trains), neither of which has the base Gaussian's
+                # entropy. Zero the bonus on both branches so the bootstrap
+                # target does not jump by alpha * (348-dim summed log-prob)
+                # every time the gate flips.
+                next_state_log_pi = torch.zeros(
+                    (next_state_actions.shape[0], 1),
+                    dtype=self.torch_dtype,
+                    device=self.device,
                 )
             if next_state_log_pi.ndim == 1:
                 next_state_log_pi = next_state_log_pi.unsqueeze(-1)
@@ -780,10 +818,27 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             if all_data_q_values.shape[0] > 1
             else 0.0,
             **probe_metrics,
+            **{f"next_{k}": v for k, v in next_selection_metrics.items()},
         }
         if transition_valid is not None:
             metrics["transition_valid_fraction"] = transition_valid.mean().item()
         return critic_loss, metrics
+
+    def _aggregate_q(self, all_qf_pi):
+        """Reduce the per-head Q values to the actor's scalar and log each head."""
+        agg_q = self.cfg.algorithm.get("actor_agg_q", self.cfg.algorithm.get("agg_q", "min"))
+        metrics = {
+            f"q_value_{q_id}": all_qf_pi[..., q_id].mean().item()
+            for q_id in range(all_qf_pi.shape[-1])
+        }
+        if agg_q == "min":
+            qf_pi, _ = torch.min(all_qf_pi, dim=1, keepdim=True)
+        elif agg_q == "mean":
+            qf_pi = torch.mean(all_qf_pi, dim=1, keepdim=True)
+        else:
+            raise ValueError(f"Unsupported actor_agg_q/agg_q {agg_q!r}")
+        metrics["q_pi"] = qf_pi.mean().item()
+        return qf_pi, metrics
 
     def _forward_actor_expo_ft(self, batch):
         """EXPO-FT actor step: train only the residual edit policy.
@@ -793,17 +848,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         anchor-based path below there is no drift to bound or measure -- the
         base action literally cannot move.
         """
-        if "actor_agg_q" in self.cfg.algorithm:
-            agg_q = self.cfg.algorithm["actor_agg_q"]
-        else:
-            agg_q = self.cfg.algorithm.get("agg_q", "min")
-
         curr_obs = batch["curr_obs"]
         edited_actions, edit_log_pi, shared_feature, extras = self.model(
-            forward_type=ForwardType.SAC_EDIT,
-            obs=curr_obs,
-            base_actions=batch["actions"],
-            mode="train",
+            forward_type=ForwardType.SAC_EDIT, obs=curr_obs, mode="train"
         )
         all_qf_pi = self.model(
             forward_type=ForwardType.SAC_Q,
@@ -812,15 +859,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             shared_feature=shared_feature,
             detach_encoder=True,
         )
-        metrics = {
-            f"q_value_{q_id}": all_qf_pi[..., q_id].mean().item()
-            for q_id in range(self.cfg.actor.model.get("num_q_heads", 2))
-        }
-        if agg_q == "min":
-            qf_pi, _ = torch.min(all_qf_pi, dim=1, keepdim=True)
-        elif agg_q == "mean":
-            qf_pi = torch.mean(all_qf_pi, dim=1, keepdim=True)
-        metrics["q_pi"] = qf_pi.mean().item()
+        qf_pi, metrics = self._aggregate_q(all_qf_pi)
         transition_valid = batch.get(TRANSITION_VALID_KEY)
         objective = (self.entropy_temp.alpha * edit_log_pi) - qf_pi
         actor_loss = masked_transition_mean(objective, transition_valid)
@@ -833,10 +872,6 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         if self.expo_ft_enabled:
             return self._forward_actor_expo_ft(batch)
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
-        if "actor_agg_q" in self.cfg.algorithm:
-            agg_q = self.cfg.algorithm["actor_agg_q"]
-        else:
-            agg_q = self.cfg.algorithm.get("agg_q", "min")
 
         curr_obs = batch["curr_obs"]
         kwargs = {}
@@ -874,15 +909,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 shared_feature=None,
                 detach_encoder=True,
             )
-        metrics = {
-            f"q_value_{q_id}": all_qf_pi[..., q_id].mean().item()
-            for q_id in range(self.cfg.actor.model.get("num_q_heads", 2))
-        }
-        if agg_q == "min":
-            qf_pi, _ = torch.min(all_qf_pi, dim=1, keepdim=True)
-        elif agg_q == "mean":
-            qf_pi = torch.mean(all_qf_pi, dim=1, keepdim=True)
-        metrics["q_pi"] = qf_pi.mean().item()
+        qf_pi, metrics = self._aggregate_q(all_qf_pi)
         transition_valid = batch.get(TRANSITION_VALID_KEY)
         objective = (self.entropy_temp.alpha * log_pi) - qf_pi
         if self.bc_coef > 0:
@@ -943,10 +970,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         with torch.no_grad():
             if self.expo_ft_enabled:
                 _, log_pi, _, _ = self.model(
-                    forward_type=ForwardType.SAC_EDIT,
-                    obs=curr_obs,
-                    base_actions=batch["actions"],
-                    mode="train",
+                    forward_type=ForwardType.SAC_EDIT, obs=curr_obs, mode="train"
                 )
             else:
                 kwargs = {}

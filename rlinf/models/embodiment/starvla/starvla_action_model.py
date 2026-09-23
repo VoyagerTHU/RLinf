@@ -662,34 +662,39 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
     def sac_edit_forward(
         self,
         obs: dict[str, Any],
-        base_actions: torch.Tensor,
         mode: str = "train",
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        """EXPO-FT actor step: edit an already-executed action, base frozen.
+        """EXPO-FT actor step: edit a fresh raw base sample, base frozen.
 
-        ``base_actions`` is the replay-stored executed action, in environment
-        units, in either layout ([B, chunks, dim] or the buffer's flattened
-        [B, chunks*dim]). Returns
-        ``(edited_env_actions, log_prob, pooled_features, extras)``; ``log_prob``
-        is zero in eval mode and ``extras["edit"]`` is the raw normalized-space
-        correction, for diagnostics.
+        The edit is conditioned on a sample drawn right now from the frozen
+        base head's own distribution -- the same thing best-of-N conditions
+        it on at rollout -- not on the replay-stored executed action. Once
+        the critic gate opens the stored action is itself a best-of-N pick
+        that may already carry an edit, so conditioning on it would train
+        the edit head on doubly-edited inputs it never sees when deployed
+        (caught in code review). This mirrors standard SAC, whose actor loss
+        evaluates Q at a freshly sampled policy action rather than at the
+        replay action.
+
+        Returns ``(edited_env_actions, log_prob, pooled_features, extras)``;
+        ``log_prob`` is zero in eval mode and ``extras["edit"]`` is the raw
+        normalized-space correction, for diagnostics.
         """
         del kwargs
         if self.edit_policy is None:
             raise RuntimeError(
                 "sac_edit_forward requires actor.model.add_edit_policy=true"
             )
-        _, last_hidden, _, model_inputs, _ = self._run_sac_oft_policy(obs)
+        mean_actions, last_hidden, dist, model_inputs, _ = self._run_sac_oft_policy(
+            obs
+        )
         pooled_features = self._pool_sac_features(
             last_hidden, model_inputs.get("attention_mask")
         )
-        batch_size = base_actions.shape[0]
-        base_norm_flat = action_space_utils.normalize_actions_from_env_torch(
-            base_actions.reshape(batch_size, -1, self.action_dim),
-            self._action_norm_stats,
-            policy_setup=self.policy_setup,
-        ).reshape(batch_size, self.action_feature_dim)
+        batch_size = mean_actions.shape[0]
+        base_norm = mean_actions if mode == "eval" else dist.sample()
+        base_norm_flat = base_norm.detach().reshape(batch_size, self.action_feature_dim)
         edit, log_prob = self.edit_policy(pooled_features, base_norm_flat, mode=mode)
         edited_norm = (base_norm_flat + edit).reshape(
             batch_size, self.num_executed_action_chunks, self.action_dim
@@ -699,7 +704,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         )
         if log_prob is None:
             log_prob = torch.zeros(
-                (batch_size, 1), dtype=torch.float32, device=base_actions.device
+                (batch_size, 1), dtype=torch.float32, device=mean_actions.device
             )
         extras = {"edit": edit.detach()}
         return edited_env_actions, log_prob.to(torch.float32), pooled_features, extras

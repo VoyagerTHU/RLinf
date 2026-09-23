@@ -212,18 +212,19 @@ def run_rollout_oft(
     sample_actions = bool(sampling_kwargs.get("do_sample")) and mode == "train"
     edit_policy = getattr(policy, "edit_policy", None)
     critic_gate_open = getattr(policy, "critic_gate_open", None)
-    # Eval always uses the (deterministic, 2-candidate) best-of-N path so the
-    # reported policy reflects what training is actually shaping. Training
-    # rollout waits for the critic gate: the Q head trains every step
-    # regardless of the actor gate, so its hidden layers rank resampled
-    # candidates by noise long before that ranking carries real signal, and
-    # best-of-N over that noise systematically steers rollout away from the
-    # pretrained policy's own well-calibrated behaviour. A first run that
-    # used best-of-N unconditionally from step 0 averaged sampled success
-    # 0.08 over 120 steps, against 0.35-0.5 in the same early phase of the
-    # anchor-based recipes that just sampled the base distribution.
-    use_best_of_n = edit_policy is not None and (
-        mode == "eval" or bool(critic_gate_open is not None and critic_gate_open.item())
+    # Both training and eval rollouts wait for the critic gate. The Q head
+    # trains every step regardless of the actor gate, so its hidden layers
+    # rank resampled candidates by noise long before that ranking carries
+    # real signal, and best-of-N over that noise systematically steers
+    # rollout away from the pretrained policy's own well-calibrated
+    # behaviour. A first run that used best-of-N unconditionally from step 0
+    # averaged sampled success 0.08 over 120 steps, against 0.35-0.5 in the
+    # same early phase of the anchor-based recipes that just sampled the base
+    # distribution. Eval follows the same gate so the reported number is the
+    # policy training actually deploys, not a Q-ranked pick by a critic that
+    # training itself has judged untrustworthy.
+    use_best_of_n = edit_policy is not None and bool(
+        critic_gate_open is not None and critic_gate_open.item()
     )
     if use_best_of_n:
         # EXPO-FT-style recipe: the executed action is whichever of the base
