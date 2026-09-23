@@ -619,12 +619,18 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 )
             if use_dsrl:
                 kwargs["train"] = True
-            if self.expo_ft_enabled:
+            if self.expo_ft_enabled and bool(
+                unwrap_module(self.model).critic_gate_open.item()
+            ):
                 # EXPO-FT: the bootstrap action at the next state is whichever
                 # of the (frozen) base head's resampled candidates, or their
                 # edited versions, Q currently prefers -- never a plain
                 # sample from the base's own Gaussian, and never something a
-                # gradient step could have dragged off distribution.
+                # gradient step could have dragged off distribution. Gated on
+                # the same critic_gate_open buffer rollout uses, so the
+                # bootstrap target does not start trusting the critic's own
+                # ranking before rollout does -- an uninformative critic
+                # would otherwise bootstrap off its own noise.
                 # The TD target's next-state Q call renormalizes internally
                 # (sac_q_forward), so it needs environment units here, not
                 # the normalized-unit selection the rollout handler uses.
@@ -1043,6 +1049,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         metrics_data["sac/q_action_std"] = q_action_std
         metrics_data["sac/q_action_ratio"] = q_action_ratio
         metrics_data["sac/critic_informative"] = float(critic_informative)
+        if self.expo_ft_enabled:
+            # Rollout (oft.py's run_rollout_oft) reads this same buffer to
+            # decide whether best-of-N is safe yet; it is weight-synced to
+            # rollout exactly like actor_logstd already is. Every rank sets
+            # the identical, already all-reduced value.
+            unwrap_module(self.model).critic_gate_open.fill_(critic_informative)
         train_actor = train_actor and critic_informative
         metrics_data["sac/actor_trained"] = float(
             train_actor and self.update_step % self.critic_actor_ratio == 0

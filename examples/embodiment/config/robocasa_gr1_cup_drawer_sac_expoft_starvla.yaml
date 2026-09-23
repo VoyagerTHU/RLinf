@@ -245,7 +245,7 @@ weight_syncer:
       # them matched afterward. Both now act during rollout (best-of-N
       # selection), unlike the old anchor-based recipe where q_head was
       # rollout-invisible.
-      prefixes: [starvla_model.action_model, actor_logstd, q_head, edit_policy]
+      prefixes: [starvla_model.action_model, actor_logstd, q_head, edit_policy, critic_gate_open]
 
 actor:
   group_name: ActorGroup

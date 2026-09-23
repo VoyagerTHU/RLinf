@@ -119,3 +119,29 @@ def test_the_two_returned_action_tensors_stay_aligned_to_the_same_selection() ->
         assert torch.equal(selected_norm[b], norm_actions[row])
         # The two must name the same (group, env) pick, not an independent one.
         assert torch.equal(selected_norm[b], -selected_env[b] - 1000.0)
+
+
+def _use_best_of_n(has_edit_policy: bool, mode: str, gate_open) -> bool:
+    """Mirror of run_rollout_oft's use_best_of_n condition."""
+    return has_edit_policy and (
+        mode == "eval" or bool(gate_open is not None and gate_open)
+    )
+
+
+def test_training_rollout_falls_back_to_plain_sampling_until_the_gate_opens() -> None:
+    assert _use_best_of_n(True, "train", False) is False
+    assert _use_best_of_n(True, "train", None) is False
+    assert _use_best_of_n(True, "train", True) is True
+
+
+def test_eval_always_uses_best_of_n_once_an_edit_policy_exists() -> None:
+    # Eval is the deterministic 2-candidate path regardless of the training
+    # gate, so official evaluation always reflects what the edit policy has
+    # learned, not a frozen fallback.
+    assert _use_best_of_n(True, "eval", False) is True
+    assert _use_best_of_n(True, "eval", None) is True
+
+
+def test_recipes_without_an_edit_policy_never_use_best_of_n() -> None:
+    assert _use_best_of_n(False, "eval", True) is False
+    assert _use_best_of_n(False, "train", True) is False

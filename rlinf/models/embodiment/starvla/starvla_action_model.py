@@ -388,6 +388,27 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
                 hidden_dims=[int(dim) for dim in edit_hidden_dims],
                 beta=edit_beta,
             ).to(dtype=torch.float32)
+            # Whether the critic is trustworthy enough for best-of-N to help
+            # rather than hurt. The Q head trains every step regardless of
+            # the actor gate, so even a few steps in its hidden layers (all
+            # randomly initialized; only the last layer is zero-init) rank
+            # the resampled candidates by noise that carries no real signal
+            # yet -- best-of-N then systematically steers rollout away from
+            # the pretrained policy's own well-calibrated behaviour for no
+            # reason. A first EXPO-FT run (2026-09-22/23) ran best-of-N from
+            # step 0 and averaged sampled success 0.08 across 120 steps,
+            # versus 0.35-0.5 in the same early phase of the anchor-based
+            # recipes that just sampled the base distribution. This buffer
+            # lets the actor worker hold rollout on plain sampling until its
+            # own critic_informative gate (q_data_std + the action-probe
+            # ratio) says otherwise, synced to rollout the same way
+            # actor_logstd already is (a persistent buffer, not a Parameter,
+            # picked up automatically by the existing weight-sync pipeline).
+            self.register_buffer(
+                "critic_gate_open",
+                torch.zeros(1, dtype=torch.bool),
+                persistent=True,
+            )
         self.sac_task_description = (
             None if sac_task_description is None else str(sac_task_description).strip()
         )
